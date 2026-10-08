@@ -260,6 +260,28 @@ def complete_step(order_id_or_code: str, payload: dict[str, Any], actor: AuthUse
     return get_purchase_order(order["id"])
 
 
+
+def _post_receipt_movements(order: dict[str, Any], receipt_id: str | None, warehouse_id: str, actor: AuthUser) -> None:
+    lines = execute(db().table("order_lines").select("*").eq("order_id", order["id"]).order("line_no")).data or []
+    now = datetime.now(timezone.utc).isoformat()
+    for ln in lines:
+        try:
+            execute(db().table("inventory_movements").insert({
+                "occurred_at": now,
+                "product_id": ln.get("product_id"),
+                "warehouse_id": warehouse_id,
+                "movement_type": "RECEIPT",
+                "quantity_delta": float(ln["quantity"]),
+                "unit_cost": float(ln.get("unit_price") or 0),
+                "order_line_id": ln["id"],
+                "goods_receipt_id": receipt_id,
+                "reference_snapshot": order["code"],
+                "created_by_user_id": actor.id,
+            }))
+        except Exception:
+            pass
+
+
 def _create_goods_receipt(order: dict[str, Any], values: dict[str, str], actor: AuthUser) -> str:
     receipt_number = _next_code("NI")
     condition = "CONFORMING"
@@ -282,10 +304,13 @@ def _create_goods_receipt(order: dict[str, Any], values: dict[str, str], actor: 
         "observations": values.get("obs") or None,
         "received_by_user_id": actor.id,
     }
+    receipt_id = None
     try:
-        execute(db().table("goods_receipts").insert(row))
+        created = execute(db().table("goods_receipts").insert(row)).data[0]
+        receipt_id = created.get("id")
     except Exception:
         pass
+    _post_receipt_movements(order, receipt_id, warehouse_id, actor)
     return f"Ingreso {receipt_number}"
 
 

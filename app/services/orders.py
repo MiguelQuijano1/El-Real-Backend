@@ -349,6 +349,29 @@ def complete_step(
     return get_sale_order(order["id"])
 
 
+
+def _post_dispatch_movements(order: dict[str, Any], dispatch_id: str | None, actor: AuthUser) -> None:
+    """Salida de stock al despachar venta."""
+    lines = execute(db().table("order_lines").select("*").eq("order_id", order["id"]).order("line_no")).data or []
+    now = datetime.now(timezone.utc).isoformat()
+    for ln in lines:
+        try:
+            execute(db().table("inventory_movements").insert({
+                "occurred_at": now,
+                "product_id": ln.get("product_id"),
+                "warehouse_id": order["warehouse_id"],
+                "movement_type": "DISPATCH",
+                "quantity_delta": -float(ln["quantity"]),
+                "unit_cost": float(ln.get("unit_price") or 0),
+                "order_line_id": ln["id"],
+                "dispatch_id": dispatch_id,
+                "reference_snapshot": order["code"],
+                "created_by_user_id": actor.id,
+            }))
+        except Exception:
+            pass
+
+
 def _create_dispatch(order: dict[str, Any], values: dict[str, str], actor: AuthUser) -> str:
     dispatch_number = _next_code("GR")
     reason = "SALE"
@@ -384,11 +407,13 @@ def _create_dispatch(order: dict[str, Any], values: dict[str, str], actor: AuthU
         "destination_snapshot": values.get("lle") or order.get("party_address") or "",
         "created_by_user_id": actor.id,
     }
+    dispatch_id = None
     try:
-        execute(db().table("dispatches").insert(row))
+        created = execute(db().table("dispatches").insert(row)).data[0]
+        dispatch_id = created.get("id")
     except Exception:
-        # Si el enum o constraints fallan, solo devolvemos el número de guía
         pass
+    _post_dispatch_movements(order, dispatch_id, actor)
     return f"Guía {dispatch_number}"
 
 
