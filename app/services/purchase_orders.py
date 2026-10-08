@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.core.errors import bad_request, not_found
-from app.repositories.client import db, execute, first
+from app.repositories.client import db, execute, find_by_id_or_code, first
+from app.services.costing import get_average_cost, product_stock_total, set_average_cost, weighted_average
 from app.security.deps import AuthUser
 from app.services.audit import RequestMeta, record
 
@@ -126,9 +127,7 @@ def list_purchase_orders(*, q: str | None = None, cancelled: bool | None = None,
 
 
 def get_purchase_order(order_id_or_code: str) -> dict[str, Any]:
-    row = first(db().table("business_orders").select(_embed()).eq("id", order_id_or_code).eq("kind", KIND)) or first(
-        db().table("business_orders").select(_embed()).eq("code", order_id_or_code).eq("kind", KIND)
-    )
+    row = find_by_id_or_code("business_orders", order_id_or_code, _embed(), kind=KIND)
     if not row:
         raise not_found("Orden de compra no encontrada")
     seller_name = ""
@@ -209,9 +208,7 @@ def create_purchase_order(payload: dict[str, Any], actor: AuthUser, meta: Reques
 
 
 def complete_step(order_id_or_code: str, payload: dict[str, Any], actor: AuthUser, meta: RequestMeta) -> dict[str, Any]:
-    order = first(db().table("business_orders").select("*").eq("id", order_id_or_code).eq("kind", KIND)) or first(
-        db().table("business_orders").select("*").eq("code", order_id_or_code).eq("kind", KIND)
-    )
+    order = find_by_id_or_code("business_orders", order_id_or_code, kind=KIND)
     if not order:
         raise not_found("Orden de compra no encontrada")
     if order.get("is_cancelled"):
@@ -264,22 +261,33 @@ def complete_step(order_id_or_code: str, payload: dict[str, Any], actor: AuthUse
 def _post_receipt_movements(order: dict[str, Any], receipt_id: str | None, warehouse_id: str, actor: AuthUser) -> None:
     lines = execute(db().table("order_lines").select("*").eq("order_id", order["id"]).order("line_no")).data or []
     now = datetime.now(timezone.utc).isoformat()
-    for ln in lines:
-        try:
+    restore: list[tuple[str, float]] = []  # costos promedio a devolver si una línea posterior falla
+    try:
+        for ln in lines:
+            if not ln.get("product_id"):
+                continue  # línea sin producto del catálogo: no mueve stock
+            pid, qty, cost = ln["product_id"], float(ln["quantity"]), float(ln.get("unit_price") or 0)
+            old_avg = get_average_cost(pid)
+            new_avg = weighted_average(product_stock_total(pid), old_avg, qty, cost)  # antes de insertar la entrada
             execute(db().table("inventory_movements").insert({
                 "occurred_at": now,
-                "product_id": ln.get("product_id"),
+                "product_id": pid,
                 "warehouse_id": warehouse_id,
                 "movement_type": "RECEIPT",
-                "quantity_delta": float(ln["quantity"]),
-                "unit_cost": float(ln.get("unit_price") or 0),
+                "quantity_delta": qty,
+                "unit_cost": cost,
                 "order_line_id": ln["id"],
                 "goods_receipt_id": receipt_id,
                 "reference_snapshot": order["code"],
                 "created_by_user_id": actor.id,
             }))
-        except Exception:
-            pass
+            if new_avg != old_avg:
+                set_average_cost(pid, new_avg)
+                restore.append((pid, old_avg))
+    except Exception:
+        for pid, old_avg in reversed(restore):
+            set_average_cost(pid, old_avg)
+        raise
 
 
 def _create_goods_receipt(order: dict[str, Any], values: dict[str, str], actor: AuthUser) -> str:
@@ -304,13 +312,14 @@ def _create_goods_receipt(order: dict[str, Any], values: dict[str, str], actor: 
         "observations": values.get("obs") or None,
         "received_by_user_id": actor.id,
     }
-    receipt_id = None
+    receipt_id = execute(db().table("goods_receipts").insert(row)).data[0]["id"]
     try:
-        created = execute(db().table("goods_receipts").insert(row)).data[0]
-        receipt_id = created.get("id")
+        _post_receipt_movements(order, receipt_id, warehouse_id, actor)
     except Exception:
-        pass
-    _post_receipt_movements(order, receipt_id, warehouse_id, actor)
+        # No dejar una nota de ingreso ni entradas a medias: el paso no avanza y se puede reintentar.
+        execute(db().table("inventory_movements").delete().eq("goods_receipt_id", receipt_id))
+        execute(db().table("goods_receipts").delete().eq("id", receipt_id))
+        raise
     return f"Ingreso {receipt_number}"
 
 
@@ -337,23 +346,23 @@ def _create_supplier_invoice(order: dict[str, Any], values: dict[str, str], acto
         "validation_status": validation,
         "created_by_user_id": actor.id,
     }
-    try:
-        execute(db().table("supplier_invoices").insert(row))
-    except Exception:
-        pass
+    # Sin try/except: si la factura no se guarda, el paso no debe avanzar.
+    execute(db().table("supplier_invoices").insert(row))
     return f"Factura {series_number}"
 
 
 def cancel_purchase_order(order_id_or_code: str, actor: AuthUser, meta: RequestMeta, reason: str | None = None) -> dict[str, Any]:
-    order = first(db().table("business_orders").select("*").eq("id", order_id_or_code).eq("kind", KIND)) or first(
-        db().table("business_orders").select("*").eq("code", order_id_or_code).eq("kind", KIND)
-    )
+    order = find_by_id_or_code("business_orders", order_id_or_code, kind=KIND)
     if not order:
         raise not_found("Orden de compra no encontrada")
     if order.get("is_cancelled"):
         raise bad_request("La orden ya está anulada")
-    if int(order.get("current_step") or 1) >= MAX_STEP:
+    step = int(order.get("current_step") or 1)
+    if step >= MAX_STEP:
         raise bad_request("No se puede anular una orden ya pagada")
+    if step >= 3:
+        # Desde la recepción ya hay ingreso de stock (y luego factura y pago): anular no los revierte.
+        raise bad_request("No se puede anular una orden ya recibida; el ingreso de stock, la factura y los pagos no se revierten")
     now = datetime.now(timezone.utc).isoformat()
     execute(db().table("business_orders").update({
         "is_cancelled": True, "cancelled_at": now, "cancelled_by_user_id": actor.id,

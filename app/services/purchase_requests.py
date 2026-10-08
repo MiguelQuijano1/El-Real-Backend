@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.core.errors import bad_request, not_found
-from app.repositories.client import db, execute, first
+from app.repositories.client import db, execute, find_by_id_or_code, first
 from app.security.deps import AuthUser
 from app.services.audit import RequestMeta, record
 from app.services import purchase_orders as po_svc
@@ -124,14 +124,10 @@ def list_requests(*, q: str | None = None, status: str | None = None, limit: int
 
 
 def get_request(id_or_code: str) -> dict[str, Any]:
-    row = first(
-        db().table("purchase_requests").select(
-            "*, lines:purchase_request_lines(*), warehouse:warehouses(id, code, name), supplier:suppliers(id, code, legal_name)"
-        ).eq("id", id_or_code)
-    ) or first(
-        db().table("purchase_requests").select(
-            "*, lines:purchase_request_lines(*), warehouse:warehouses(id, code, name), supplier:suppliers(id, code, legal_name)"
-        ).eq("code", id_or_code)
+    row = find_by_id_or_code(
+        "purchase_requests",
+        id_or_code,
+        "*, lines:purchase_request_lines(*), warehouse:warehouses(id, code, name), supplier:suppliers(id, code, legal_name)",
     )
     if not row:
         raise not_found("Solicitud no encontrada")
@@ -180,9 +176,7 @@ def create_request(payload: dict[str, Any], actor: AuthUser, meta: RequestMeta) 
 
 
 def update_request(id_or_code: str, payload: dict[str, Any], actor: AuthUser, meta: RequestMeta) -> dict[str, Any]:
-    current = first(db().table("purchase_requests").select("*").eq("id", id_or_code)) or first(
-        db().table("purchase_requests").select("*").eq("code", id_or_code)
-    )
+    current = find_by_id_or_code("purchase_requests", id_or_code)
     if not current:
         raise not_found("Solicitud no encontrada")
     if current.get("status") not in ("PENDING",):
@@ -221,9 +215,7 @@ def update_request(id_or_code: str, payload: dict[str, Any], actor: AuthUser, me
 
 
 def set_status(id_or_code: str, status: str, actor: AuthUser, meta: RequestMeta, rejection_reason: str | None = None) -> dict[str, Any]:
-    current = first(db().table("purchase_requests").select("*").eq("id", id_or_code)) or first(
-        db().table("purchase_requests").select("*").eq("code", id_or_code)
-    )
+    current = find_by_id_or_code("purchase_requests", id_or_code)
     if not current:
         raise not_found("Solicitud no encontrada")
     key = UI_STATUS.get(status, status)
@@ -246,9 +238,7 @@ def set_status(id_or_code: str, status: str, actor: AuthUser, meta: RequestMeta,
 
 
 def delete_request(id_or_code: str, actor: AuthUser, meta: RequestMeta) -> None:
-    current = first(db().table("purchase_requests").select("*").eq("id", id_or_code)) or first(
-        db().table("purchase_requests").select("*").eq("code", id_or_code)
-    )
+    current = find_by_id_or_code("purchase_requests", id_or_code)
     if not current:
         raise not_found("Solicitud no encontrada")
     if current.get("status") != "PENDING":

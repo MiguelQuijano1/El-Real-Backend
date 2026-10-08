@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.core.errors import bad_request, not_found
-from app.repositories.client import db, execute, first
+from app.repositories.client import db, execute, find_by_id_or_code, first
 from app.security.deps import AuthUser
 from app.services.audit import RequestMeta, record
 from app.services import orders as orders_svc
@@ -139,9 +139,7 @@ def list_quotations(*, q: str | None = None, status: str | None = None, limit: i
 
 
 def get_quotation(id_or_code: str) -> dict[str, Any]:
-    row = first(db().table("quotations").select(_embed()).eq("id", id_or_code))
-    if not row:
-        row = first(db().table("quotations").select(_embed()).eq("code", id_or_code))
+    row = find_by_id_or_code("quotations", id_or_code, _embed())
     if not row:
         raise not_found("Cotización no encontrada")
     seller = ""
@@ -208,9 +206,7 @@ def create_quotation(payload: dict[str, Any], actor: AuthUser, meta: RequestMeta
 
 
 def update_quotation(id_or_code: str, payload: dict[str, Any], actor: AuthUser, meta: RequestMeta) -> dict[str, Any]:
-    current = first(db().table("quotations").select("*").eq("id", id_or_code)) or first(
-        db().table("quotations").select("*").eq("code", id_or_code)
-    )
+    current = find_by_id_or_code("quotations", id_or_code)
     if not current:
         raise not_found("Cotización no encontrada")
     if current.get("status") in ("CONVERTED", "REJECTED"):
@@ -271,9 +267,7 @@ def set_status(id_or_code: str, status: str, actor: AuthUser, meta: RequestMeta,
 
 
 def delete_quotation(id_or_code: str, actor: AuthUser, meta: RequestMeta) -> None:
-    current = first(db().table("quotations").select("*").eq("id", id_or_code)) or first(
-        db().table("quotations").select("*").eq("code", id_or_code)
-    )
+    current = find_by_id_or_code("quotations", id_or_code)
     if not current:
         raise not_found("Cotización no encontrada")
     if current.get("status") not in ("DRAFT",):

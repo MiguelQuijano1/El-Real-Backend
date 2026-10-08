@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.core.errors import bad_request, not_found
-from app.repositories.client import db, execute, first, rows
+from app.repositories.client import db, execute, find_by_id_or_code, first, rows
 from app.security.deps import AuthUser
 from app.services.audit import RequestMeta, record
 
@@ -54,6 +54,18 @@ def list_stock(*, q: str | None = None, warehouse_id: str | None = None, limit: 
         key = (m["product_id"], m["warehouse_id"])
         balances[key] += float(m.get("quantity_delta") or 0)
 
+    # Reservado = líneas de ventas confirmadas que aún no se despachan (paso actual 2), por producto y almacén.
+    reserved: dict[tuple[str, str], float] = defaultdict(float)
+    confirmed = rows(
+        db().table("business_orders")
+        .select("warehouse_id, lines:order_lines(product_id, quantity)")
+        .eq("kind", "SALE").eq("is_cancelled", False).eq("current_step", 2)
+    )
+    for o in confirmed:
+        for ln in o.get("lines") or []:
+            if ln.get("product_id") and o.get("warehouse_id"):
+                reserved[(ln["product_id"], o["warehouse_id"])] += float(ln.get("quantity") or 0)
+
     products = {p["id"]: p for p in rows(db().table("products").select("id, sku, name, category_id, average_cost, minimum_stock, status").eq("status", "ACTIVE"))}
     warehouses = {w["id"]: w for w in rows(db().table("warehouses").select("id, code, name, status"))}
     categories = {c["id"]: c for c in rows(db().table("product_categories").select("id, name"))}
@@ -71,6 +83,7 @@ def list_stock(*, q: str | None = None, warehouse_id: str | None = None, limit: 
         min_s = float(p.get("minimum_stock") or 0)
         cost = float(p.get("average_cost") or 0)
         cat = categories.get(p.get("category_id") or "")
+        res = reserved.get((pid, wid), 0.0)
         row = {
             "productId": pid,
             "warehouseId": wid,
@@ -80,8 +93,8 @@ def list_stock(*, q: str | None = None, warehouse_id: str | None = None, limit: 
             "alm": w.get("name"),
             "stock": qty,
             "min": min_s,
-            "res": 0,
-            "disp": qty,
+            "res": res,
+            "disp": qty - res,
             "valor": round(qty * cost, 2),
             "estado": _stock_status(qty, min_s),
         }
@@ -254,9 +267,7 @@ def _balance(product_id: str, warehouse_id: str) -> float:
 
 
 def dispatch_transfer(id_or_code: str, actor: AuthUser, meta: RequestMeta) -> dict[str, Any]:
-    t = first(db().table("inventory_transfers").select("*").eq("id", id_or_code)) or first(
-        db().table("inventory_transfers").select("*").eq("code", id_or_code)
-    )
+    t = find_by_id_or_code("inventory_transfers", id_or_code)
     if not t:
         raise not_found("Transferencia no encontrada")
     if t.get("status") != "PENDING":
@@ -289,9 +300,7 @@ def dispatch_transfer(id_or_code: str, actor: AuthUser, meta: RequestMeta) -> di
 
 
 def receive_transfer(id_or_code: str, actor: AuthUser, meta: RequestMeta) -> dict[str, Any]:
-    t = first(db().table("inventory_transfers").select("*").eq("id", id_or_code)) or first(
-        db().table("inventory_transfers").select("*").eq("code", id_or_code)
-    )
+    t = find_by_id_or_code("inventory_transfers", id_or_code)
     if not t:
         raise not_found("Transferencia no encontrada")
     if t.get("status") != "IN_TRANSIT":
@@ -321,9 +330,7 @@ def receive_transfer(id_or_code: str, actor: AuthUser, meta: RequestMeta) -> dic
 
 
 def cancel_transfer(id_or_code: str, actor: AuthUser, meta: RequestMeta) -> dict[str, Any]:
-    t = first(db().table("inventory_transfers").select("*").eq("id", id_or_code)) or first(
-        db().table("inventory_transfers").select("*").eq("code", id_or_code)
-    )
+    t = find_by_id_or_code("inventory_transfers", id_or_code)
     if not t:
         raise not_found("Transferencia no encontrada")
     if t.get("status") not in ("PENDING",):

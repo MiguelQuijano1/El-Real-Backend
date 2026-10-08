@@ -5,7 +5,8 @@ from decimal import Decimal
 from typing import Any
 
 from app.core.errors import bad_request, not_found
-from app.repositories.client import db, execute, first
+from app.repositories.client import db, execute, find_by_id_or_code, first
+from app.services.costing import get_average_cost
 from app.security.deps import AuthUser
 from app.services.audit import RequestMeta, record
 
@@ -159,13 +160,7 @@ def list_sale_orders(
 
 
 def get_sale_order(order_id_or_code: str) -> dict[str, Any]:
-    row = first(
-        db().table("business_orders").select(_embed()).eq("id", order_id_or_code).eq("kind", KIND_SALE)
-    )
-    if not row:
-        row = first(
-            db().table("business_orders").select(_embed()).eq("code", order_id_or_code).eq("kind", KIND_SALE)
-        )
+    row = find_by_id_or_code("business_orders", order_id_or_code, _embed(), kind=KIND_SALE)
     if not row:
         raise not_found("Orden de venta no encontrada")
     seller_name = ""
@@ -277,11 +272,7 @@ def complete_step(
     actor: AuthUser,
     meta: RequestMeta,
 ) -> dict[str, Any]:
-    order = first(
-        db().table("business_orders").select("*").eq("id", order_id_or_code).eq("kind", KIND_SALE)
-    ) or first(
-        db().table("business_orders").select("*").eq("code", order_id_or_code).eq("kind", KIND_SALE)
-    )
+    order = find_by_id_or_code("business_orders", order_id_or_code, kind=KIND_SALE)
     if not order:
         raise not_found("Orden de venta no encontrada")
     if order.get("is_cancelled"):
@@ -355,24 +346,39 @@ def _post_dispatch_movements(order: dict[str, Any], dispatch_id: str | None, act
     lines = execute(db().table("order_lines").select("*").eq("order_id", order["id"]).order("line_no")).data or []
     now = datetime.now(timezone.utc).isoformat()
     for ln in lines:
-        try:
-            execute(db().table("inventory_movements").insert({
-                "occurred_at": now,
-                "product_id": ln.get("product_id"),
-                "warehouse_id": order["warehouse_id"],
-                "movement_type": "DISPATCH",
-                "quantity_delta": -float(ln["quantity"]),
-                "unit_cost": float(ln.get("unit_price") or 0),
-                "order_line_id": ln["id"],
-                "dispatch_id": dispatch_id,
-                "reference_snapshot": order["code"],
-                "created_by_user_id": actor.id,
-            }))
-        except Exception:
-            pass
+        if not ln.get("product_id"):
+            continue  # línea sin producto del catálogo: no mueve stock
+        execute(db().table("inventory_movements").insert({
+            "occurred_at": now,
+            "product_id": ln["product_id"],
+            "warehouse_id": order["warehouse_id"],
+            "movement_type": "DISPATCH",
+            "quantity_delta": -float(ln["quantity"]),
+            "unit_cost": get_average_cost(ln["product_id"]),  # la salida se valoriza al costo promedio, no al precio de venta
+            "order_line_id": ln["id"],
+            "dispatch_id": dispatch_id,
+            "reference_snapshot": order["code"],
+            "created_by_user_id": actor.id,
+        }))
+
+
+def _ensure_stock_for_dispatch(order: dict[str, Any]) -> None:
+    from app.services.inventory import _balance  # import local: inventory también usa este módulo de servicios
+
+    settings = first(db().table("company_settings").select("allow_negative_stock").eq("id", 1)) or {}
+    if settings.get("allow_negative_stock"):
+        return  # la empresa permite despachar sin stock suficiente (Configuración › Inventario)
+    lines = execute(db().table("order_lines").select("*").eq("order_id", order["id"]).order("line_no")).data or []
+    for ln in lines:
+        if not ln.get("product_id"):
+            continue
+        have = _balance(ln["product_id"], order["warehouse_id"])
+        if have < float(ln["quantity"]):
+            raise bad_request(f"Stock insuficiente de {ln.get('sku_snapshot')} en el almacén de despacho (hay {have:g}, pide {float(ln['quantity']):g})")
 
 
 def _create_dispatch(order: dict[str, Any], values: dict[str, str], actor: AuthUser) -> str:
+    _ensure_stock_for_dispatch(order)
     dispatch_number = _next_code("GR")
     reason = "SALE"
     if values.get("mot") and "confirmación" in values["mot"].lower():
@@ -407,13 +413,14 @@ def _create_dispatch(order: dict[str, Any], values: dict[str, str], actor: AuthU
         "destination_snapshot": values.get("lle") or order.get("party_address") or "",
         "created_by_user_id": actor.id,
     }
-    dispatch_id = None
+    dispatch_id = execute(db().table("dispatches").insert(row)).data[0]["id"]
     try:
-        created = execute(db().table("dispatches").insert(row)).data[0]
-        dispatch_id = created.get("id")
+        _post_dispatch_movements(order, dispatch_id, actor)
     except Exception:
-        pass
-    _post_dispatch_movements(order, dispatch_id, actor)
+        # No dejar una guía ni salidas a medias: el paso no avanza y se puede reintentar.
+        execute(db().table("inventory_movements").delete().eq("dispatch_id", dispatch_id))
+        execute(db().table("dispatches").delete().eq("id", dispatch_id))
+        raise
     return f"Guía {dispatch_number}"
 
 
@@ -427,11 +434,13 @@ def _create_sales_invoice(order: dict[str, Any], values: dict[str, str], actor: 
     total = round(subtotal + tax_amount, 2)
 
     settings = first(db().table("company_settings").select("invoice_series, receipt_series").eq("id", 1)) or {}
+    # El frontend envía `tipo` ("Boleta de venta electrónica"…) y `ser`; se aceptan también `td`/`serie`.
     doc_type = "INVOICE"
-    series = values.get("serie") or settings.get("invoice_series") or "F001"
-    if values.get("td") == "Boleta":
+    chosen_series = values.get("ser") or values.get("serie")
+    series = chosen_series or settings.get("invoice_series") or "F001"
+    if values.get("td") == "Boleta" or (values.get("tipo") or "").lower().startswith("boleta"):
         doc_type = "RECEIPT"
-        series = values.get("serie") or settings.get("receipt_series") or "B001"
+        series = chosen_series or settings.get("receipt_series") or "B001"
     number = values.get("num") or str(int(datetime.now(timezone.utc).timestamp()) % 100000).zfill(5)
     issued = values.get("fe") or datetime.now(timezone.utc).date().isoformat()
     due = values.get("fv") or issued
@@ -450,10 +459,8 @@ def _create_sales_invoice(order: dict[str, Any], values: dict[str, str], actor: 
         "total": total,
         "tax_status": "PENDING",
     }
-    try:
-        execute(db().table("sales_invoices").insert(row))
-    except Exception:
-        pass
+    # Sin try/except: si la factura no se guarda, el paso no debe avanzar.
+    execute(db().table("sales_invoices").insert(row))
     return f"{series}-{number}"
 
 
@@ -463,11 +470,7 @@ def cancel_sale_order(
     meta: RequestMeta,
     reason: str | None = None,
 ) -> dict[str, Any]:
-    order = first(
-        db().table("business_orders").select("*").eq("id", order_id_or_code).eq("kind", KIND_SALE)
-    ) or first(
-        db().table("business_orders").select("*").eq("code", order_id_or_code).eq("kind", KIND_SALE)
-    )
+    order = find_by_id_or_code("business_orders", order_id_or_code, kind=KIND_SALE)
     if not order:
         raise not_found("Orden de venta no encontrada")
     if order.get("is_cancelled"):
@@ -475,6 +478,9 @@ def cancel_sale_order(
     step = int(order.get("current_step") or 1)
     if step >= MAX_STEP:
         raise bad_request("No se puede anular una orden ya cobrada")
+    if step >= 3:
+        # Desde el despacho ya hay salida de stock (y luego factura y cobros): anular no los revierte.
+        raise bad_request("No se puede anular una orden ya despachada; la salida de stock, la factura y los cobros no se revierten")
 
     now = datetime.now(timezone.utc).isoformat()
     execute(
