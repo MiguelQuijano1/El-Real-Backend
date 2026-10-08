@@ -13,13 +13,17 @@ from app.services.audit import RequestMeta, record
 
 ALLOWED_MIME = {
     "application/pdf", "image/png", "image/jpeg", "image/webp", "text/plain", "text/csv",
-    "application/zip", "application/msword",
+    "application/zip", "application/msword", "application/xml", "text/xml",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/vnd.ms-excel",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
+# storage_key nunca sale al cliente. Los embebidos traen el nombre de quien subió y a qué se vincula el documento,
+# para que el frontend no necesite permisos de Usuarios, Clientes o Proveedores solo para mostrarlos.
 DOC_SELECT = ("id, name, category, mime_type, byte_size, version_label, related_order_id, related_customer_id, "
-              "related_supplier_id, uploaded_by_user_id, created_at")  # storage_key nunca sale al cliente
+              "related_supplier_id, uploaded_by_user_id, created_at, uploader:users(full_name), "
+              "customer:customers(code, legal_name), supplier:suppliers(code, legal_name), "
+              "order:business_orders(code)")
 
 
 _UNSAFE = re.compile(r"[%*,()\\]")
