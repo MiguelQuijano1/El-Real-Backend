@@ -62,10 +62,9 @@ def _parse_ts(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
 
 
-def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> AuthUser:
-    if credentials is None or credentials.scheme.lower() != "bearer":
-        raise unauthorized()
-    payload = decode_access_token(credentials.credentials)
+def user_from_token(token: str) -> AuthUser:
+    """Valida un token de acceso contra la sesión guardada y devuelve el usuario (lanza 401 si no sirve)."""
+    payload = decode_access_token(token)
     if payload is None:
         raise unauthorized()
 
@@ -75,7 +74,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(
         .select(f"id, last_seen_at, user:users({USER_COLUMNS}, {ROLE_EMBED})")
         .eq("id", payload["sid"])
         .eq("user_id", payload["sub"])
-        .eq("token_hash", hash_token(credentials.credentials))
+        .eq("token_hash", hash_token(token))
         .is_("revoked_at", "null")
         .gt("expires_at", now.isoformat())
     )
@@ -99,6 +98,12 @@ def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(
         area=user["area"], status=user["status"], last_login_at=user["last_login_at"],
         role=user["role"], session_id=session["id"],
     )
+
+
+def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> AuthUser:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise unauthorized()
+    return user_from_token(credentials.credentials)
 
 
 # ─── Políticas de acceso ────────────────────────────────────────────────────────

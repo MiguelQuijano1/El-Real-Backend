@@ -82,6 +82,10 @@ MASTERS: list[tuple[str, MasterConfig, type, tuple[str, ...]]] = [
     ("vehicles", MasterConfig("vehicles", "vehicles", "Vehicle", "Vehículo", "plate",
                               ("plate", "brand", "model"), None,
                               filters=("carrier_supplier_id",)), m.VehicleIn, ()),
+    # Lista de precios por proveedor. Usa los permisos de Proveedores.
+    ("supplier-products", MasterConfig("supplier_products", "suppliers", "SupplierProduct", "Precio de proveedor", "supplier_id",
+                                     ("supplier_sku", "notes"), None,
+                                     filters=("supplier_id", "product_id")), m.SupplierProductIn, ()),
 ]
 
 

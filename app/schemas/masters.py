@@ -101,6 +101,16 @@ class DriverIn(ApiModel):
     status: RecordStatus = "ACTIVE"
 
 
+class SupplierProductIn(ApiModel):
+    """Precio de compra de un producto en un proveedor (sin IGV)."""
+    supplier_id: UUID
+    product_id: UUID
+    supplier_sku: str | None = Field(default=None, max_length=64)
+    unit_cost: Decimal = Field(ge=0)
+    notes: str | None = None
+    status: RecordStatus = "ACTIVE"
+
+
 class VehicleIn(ApiModel):
     plate: str = Field(min_length=1, max_length=16)
     vehicle_type: str = Field(min_length=1, max_length=32)

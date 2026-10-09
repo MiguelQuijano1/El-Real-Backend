@@ -130,7 +130,8 @@ class _Res:
 class _OrdersFakeDb:
     """Cliente falso mínimo para `_create_sales_invoice`: líneas, ajustes y un insert que puede fallar."""
 
-    def __init__(self, fail_insert_on=None):
+    def __init__(self, fail_insert_on=None, auto_tax_submission=False):
+        self.auto_tax_submission = auto_tax_submission
         self.inserted = []
         self.fail_insert_on = fail_insert_on
         self._table = None
@@ -168,7 +169,7 @@ class _OrdersFakeDb:
         if self._table == "order_lines":
             return _Res([{"quantity": 2, "unit_price": 10}])
         if self._table == "company_settings":
-            return _Res([{"invoice_series": "F001", "receipt_series": "B001"}])
+            return _Res([{"invoice_series": "F001", "receipt_series": "B001", "auto_tax_submission": self.auto_tax_submission}])
         return _Res([])
 
 
@@ -204,6 +205,20 @@ def test_sales_invoice_understands_the_frontend_field_names():
     assert (factura["document_type"], factura["series"]) == ("INVOICE", "F001")
 
 
+@pytest.mark.parametrize("auto, expected", [(False, "PENDING"), (True, "ACCEPTED")])
+def test_sales_invoice_tax_status_follows_auto_submission_setting(auto, expected):
+    from app.repositories.client import set_client
+    from app.services import orders
+
+    fake = _OrdersFakeDb(auto_tax_submission=auto)
+    set_client(fake)
+    try:
+        orders._create_sales_invoice(_ORDER, {}, None)
+    finally:
+        set_client(None)
+    assert fake.inserted[0][1]["tax_status"] == expected
+
+
 @pytest.mark.parametrize(
     "stock, avg, qty, cost, expected",
     [
@@ -219,3 +234,48 @@ def test_weighted_average_cost(stock, avg, qty, cost, expected):
     from app.services.costing import weighted_average
 
     assert weighted_average(stock, avg, qty, cost) == pytest.approx(expected)
+
+
+def test_change_notifier_publishes_only_successful_writes():
+    from fastapi import FastAPI, HTTPException
+    from fastapi.testclient import TestClient
+
+    from app.core.realtime import ChangeNotifier, hub
+
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send_json(self, event):
+            self.sent.append(event)
+
+    app = FastAPI()
+    app.add_middleware(ChangeNotifier)
+
+    @app.post("/api/v1/quotations")
+    def create():
+        return {"ok": True}
+
+    @app.post("/api/v1/sales-orders")
+    def fail():
+        raise HTTPException(400, "mal")
+
+    @app.get("/api/v1/quotations")
+    def read():
+        return []
+
+    @app.post("/api/v1/auth/login")
+    def login():
+        return {}
+
+    ws = FakeSocket()
+    hub.add(ws)
+    try:
+        client = TestClient(app)
+        client.post("/api/v1/quotations", headers={"X-Client-Id": "tab-1"})
+        client.post("/api/v1/sales-orders")  # falla: no avisa
+        client.get("/api/v1/quotations")  # lectura: no avisa
+        client.post("/api/v1/auth/login")  # login: no avisa
+    finally:
+        hub.remove(ws)
+    assert ws.sent == [{"type": "changed", "resource": "quotations", "by": "tab-1"}]

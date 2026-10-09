@@ -266,6 +266,11 @@ def pay_payable(invoice_id: str, payload: dict[str, Any], actor: AuthUser, meta:
     if channel not in ("CASH", "BANK"):
         channel = "BANK"
 
+    if channel == "CASH":
+        available = cash_balance()
+        if amount > available + 0.01:
+            raise bad_request(f"Saldo de caja insuficiente para pagar {amount:.2f} (disponible {available:.2f})")
+
     bank_account_id = payload.get("bank_account_id")
     if channel == "BANK" and not bank_account_id:
         acc = first(db().table("bank_accounts").select("id").eq("is_active", True))

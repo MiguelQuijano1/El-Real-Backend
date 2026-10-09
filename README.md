@@ -56,7 +56,7 @@ curl -X POST http://localhost:8000/api/v1/auth/login \
   `tests/test_route_policies.py` **falla si alguna ruta no declara política**. El rol `ADMIN` tiene acceso total.
 - **Bloqueo de cuenta** al llegar a `maxLoginAttempts` (Configuración, 5 por defecto), con contador atómico en SQL.
   Se desbloquea con `PATCH /users/{id}/status`.
-- **Límite de peticiones:** 10 logins/min y 5 cambios de contraseña/min por IP; 120 peticiones/min en general.
+- **Límite de peticiones:** 10 logins/min y 5 cambios de contraseña/min por IP; 600 peticiones/min en general (configurable con `GLOBAL_RATE_LIMIT_PER_MINUTE` en el `.env`; `0` = sin límite).
   Es en memoria (una instancia). Con varias instancias usa además un WAF/API Gateway.
   Detrás de un proxy (Nginx, etc.) pon `TRUST_PROXY=true` para usar la IP real.
 - Un usuario con `users:create/edit` **no puede** crear, editar ni asignar el rol Administrador, y nadie cambia su propio estado o rol.

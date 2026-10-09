@@ -433,7 +433,7 @@ def _create_sales_invoice(order: dict[str, Any], values: dict[str, str], actor: 
     tax_amount = round(subtotal * tax_rate, 2)
     total = round(subtotal + tax_amount, 2)
 
-    settings = first(db().table("company_settings").select("invoice_series, receipt_series").eq("id", 1)) or {}
+    settings = first(db().table("company_settings").select("invoice_series, receipt_series, auto_tax_submission").eq("id", 1)) or {}
     # El frontend envía `tipo` ("Boleta de venta electrónica"…) y `ser`; se aceptan también `td`/`serie`.
     doc_type = "INVOICE"
     chosen_series = values.get("ser") or values.get("serie")
@@ -457,7 +457,9 @@ def _create_sales_invoice(order: dict[str, Any], values: dict[str, str], actor: 
         "subtotal": subtotal,
         "tax_amount": tax_amount,
         "total": total,
-        "tax_status": "PENDING",
+        # Con "Envío a SUNAT automático" (Configuración › Comprobantes) el comprobante nace aceptado; si no, queda
+        # pendiente hasta que alguien use "Reenviar a SUNAT". (No hay conexión real con SUNAT: es el mismo estado simulado.)
+        "tax_status": "ACCEPTED" if settings.get("auto_tax_submission") else "PENDING",
     }
     # Sin try/except: si la factura no se guarda, el paso no debe avanzar.
     execute(db().table("sales_invoices").insert(row))

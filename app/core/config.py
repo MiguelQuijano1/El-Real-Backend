@@ -2,7 +2,7 @@ import re
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _DURATION = re.compile(r"^([1-9]\d*)([smhd])$")
@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     environment: Literal["development", "production", "test"] = "development"
     cors_origins: str = "http://localhost:5173"
     trust_proxy: bool = False
+    # Límite global de peticiones por minuto y por IP (0 = sin límite). Con la actualización automática (WebSocket)
+    # cada cambio hace que los demás clientes relean datos, así que conviene dejar margen si varios comparten red.
+    global_rate_limit_per_minute: int = Field(default=600, ge=0)
 
     supabase_url: str
     supabase_service_role_key: str
