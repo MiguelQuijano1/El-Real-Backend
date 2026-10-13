@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from app.core.errors import bad_request, not_found
@@ -19,6 +19,34 @@ STATUS_UI = {
     "REJECTED": "Rechazada",
 }
 UI_STATUS = {v: k for k, v in STATUS_UI.items()}
+
+# Una cotización abierta cuya fecha de validez ya pasó se muestra como «Vencida». No se guarda: se deriva de
+# `valid_until`, así que extender la fecha la reactiva sola y no hace falta ningún proceso programado.
+EXPIRABLE = ("DRAFT", "SENT", "APPROVED")
+EXPIRED_KEY = "EXPIRED"
+EXPIRED_UI = "Vencida"
+_LIMA = timezone(timedelta(hours=-5))
+
+
+def _today() -> date:
+    return datetime.now(_LIMA).date()
+
+
+def _as_date(value: Any) -> date | None:
+    if not value:
+        return None
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def is_expired(status: str | None, valid_until: Any, today: date | None = None) -> bool:
+    """Vence el día siguiente a `valid_until` (la fecha indicada aún es válida)."""
+    until = _as_date(valid_until)
+    return status in EXPIRABLE and until is not None and until < (today or _today())
 
 
 def _next_code() -> str:
@@ -52,9 +80,12 @@ def _embed() -> str:
 def _serialize(row: dict[str, Any], seller_name: str = "", order_code: str | None = None) -> dict[str, Any]:
     lines = sorted(row.get("lines") or [], key=lambda x: x.get("line_no", 0))
     customer = row.get("customer") or {}
+    prospect = not row.get("customer_id")
     warehouse = row.get("warehouse") or {}
     terms_days = int(row.get("payment_terms_days") or 0)
     status = row.get("status") or "DRAFT"
+    if is_expired(status, row.get("valid_until")):
+        status = EXPIRED_KEY
     items = [
         {
             "sku": ln.get("sku_snapshot"),
@@ -76,19 +107,22 @@ def _serialize(row: dict[str, Any], seller_name: str = "", order_code: str | Non
     party_sub = ""
     if customer.get("document_number"):
         party_sub = f"{customer.get('document_type') or 'RUC'} {customer.get('document_number')}"
+    elif prospect:
+        party_sub = "Cotización abierta"
     return {
         "id": row["id"],
         "code": row["code"],
-        "status": STATUS_UI.get(status, status),
+        "status": EXPIRED_UI if status == EXPIRED_KEY else STATUS_UI.get(status, status),
         "statusKey": status,
         "createdAt": row.get("created_at"),
         "date": (row.get("created_at") or "")[:10],
         "validUntil": row.get("valid_until"),
         "customerId": row.get("customer_id"),
+        "prospect": prospect,
         "warehouseId": row.get("warehouse_id"),
         "sellerUserId": row.get("seller_user_id"),
         "seller": seller_name,
-        "party": customer.get("legal_name") or "",
+        "party": customer.get("legal_name") or "Sin cliente",
         "partySub": party_sub,
         "items": items,
         "data": data,
@@ -151,9 +185,12 @@ def get_quotation(id_or_code: str) -> dict[str, Any]:
 
 
 def create_quotation(payload: dict[str, Any], actor: AuthUser, meta: RequestMeta) -> dict[str, Any]:
-    customer = first(db().table("customers").select("*").eq("id", payload["customer_id"]))
-    if not customer:
-        raise bad_request("Cliente no encontrado")
+    # El cliente es opcional: una cotización puede hacerse sin saber aún quién comprará.
+    customer: dict[str, Any] = {}
+    if payload.get("customer_id"):
+        customer = first(db().table("customers").select("*").eq("id", payload["customer_id"])) or {}
+        if not customer:
+            raise bad_request("Cliente no encontrado")
     lines_in = payload.get("lines") or []
     if not lines_in:
         raise bad_request("La cotización debe tener al menos una línea")
@@ -169,7 +206,7 @@ def create_quotation(payload: dict[str, Any], actor: AuthUser, meta: RequestMeta
     code = _next_code()
     row = {
         "code": code,
-        "customer_id": payload["customer_id"],
+        "customer_id": payload.get("customer_id") or None,
         "seller_user_id": payload.get("seller_user_id") or actor.id,
         "warehouse_id": warehouse_id,
         "valid_until": payload.get("valid_until"),
@@ -199,7 +236,7 @@ def create_quotation(payload: dict[str, Any], actor: AuthUser, meta: RequestMeta
         entity_type="Quotation",
         entity_id=qid,
         reference=code,
-        description=f"Cotización creada · {customer.get('legal_name')}",
+        description=f"Cotización creada · {customer.get('legal_name') or 'sin cliente'}",
         meta=meta,
     )
     return get_quotation(qid)
@@ -213,12 +250,18 @@ def update_quotation(id_or_code: str, payload: dict[str, Any], actor: AuthUser, 
         raise bad_request("No se puede editar una cotización convertida o rechazada")
 
     patch: dict[str, Any] = {}
+    if payload.get("customer_id"):
+        if not first(db().table("customers").select("id").eq("id", payload["customer_id"])):
+            raise bad_request("Cliente no encontrado")
     for key in ("customer_id", "seller_user_id", "warehouse_id", "valid_until", "payment_terms_days", "rejected_reason"):
         if key in payload and payload[key] is not None:
             patch[key] = payload[key]
     if payload.get("status") and payload["status"] in ("DRAFT", "SENT", "APPROVED", "REJECTED"):
         if current.get("status") == "CONVERTED":
             raise bad_request("La cotización ya fue convertida")
+        # Enviar o aprobar con la fecha vencida no tiene sentido; rechazarla o volverla borrador sí se permite.
+        if payload["status"] in ("SENT", "APPROVED") and is_expired(payload["status"], patch.get("valid_until", current.get("valid_until"))):
+            raise bad_request("La cotización venció. Extiende la fecha de validez para poder enviarla o aprobarla")
         patch["status"] = payload["status"]
 
     if patch:
@@ -286,9 +329,16 @@ def delete_quotation(id_or_code: str, actor: AuthUser, meta: RequestMeta) -> Non
     )
 
 
-def convert_quotation(id_or_code: str, actor: AuthUser, meta: RequestMeta) -> dict[str, Any]:
-    """Convierte una cotización APROBADA en orden de venta."""
+def convert_quotation(
+    id_or_code: str, actor: AuthUser, meta: RequestMeta, customer_id: str | None = None
+) -> dict[str, Any]:
+    """Convierte una cotización APROBADA en orden de venta.
+
+    Si la cotización no tiene cliente, `customer_id` indica con qué cliente se crea la orden.
+    """
     q = get_quotation(id_or_code)
+    if q["statusKey"] == EXPIRED_KEY:
+        raise bad_request("La cotización venció el " + str(q.get("validUntil")) + ". Extiende la fecha de validez para convertirla")
     if q["statusKey"] != "APPROVED":
         raise bad_request("Solo se puede convertir una cotización aprobada")
     if q.get("order"):
@@ -297,6 +347,18 @@ def convert_quotation(id_or_code: str, actor: AuthUser, meta: RequestMeta) -> di
     raw = first(db().table("quotations").select("*").eq("id", q["id"]))
     if not raw:
         raise not_found("Cotización no encontrada")
+    if not raw.get("customer_id"):
+        if not customer_id:
+            raise bad_request("Esta cotización no tiene cliente: elige el cliente para crear la orden de venta")
+        if not first(db().table("customers").select("id").eq("id", customer_id)):
+            raise bad_request("Cliente no encontrado")
+        execute(
+            db()
+            .table("quotations")
+            .update({"customer_id": customer_id})
+            .eq("id", raw["id"])
+        )
+        raw["customer_id"] = customer_id
 
     lines = [
         {

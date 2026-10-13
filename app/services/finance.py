@@ -9,8 +9,8 @@ from app.repositories.client import db, execute, first, rows
 from app.security.deps import AuthUser
 from app.services.audit import RequestMeta, record
 
-MODULE_AR = "ar"
-MODULE_AP = "ap"
+MODULE_AR = "receivables"
+MODULE_AP = "payables"
 MODULE_CASH = "cash"
 MODULE_BANKS = "banks"
 
@@ -238,39 +238,45 @@ def list_payables(*, q: str | None = None, limit: int = 100, offset: int = 0) ->
     return {"items": items[offset : offset + limit], "total": total_n, "limit": limit, "offset": offset}
 
 
-def pay_payable(invoice_id: str, payload: dict[str, Any], actor: AuthUser, meta: RequestMeta) -> dict[str, Any]:
-    inv = first(db().table("supplier_invoices").select("*").eq("id", invoice_id))
-    if not inv:
-        inv = first(db().table("supplier_invoices").select("*").eq("series_number", invoice_id))
-    if not inv:
-        raise not_found("Factura de proveedor no encontrada")
-
-    amount = abs(float(payload.get("amount") or 0))
-    if amount <= 0:
-        raise bad_request("El monto debe ser mayor a 0")
-
-    paid = sum(
+def _paid_amount(invoice_id: str) -> float:
+    return sum(
         abs(float(m.get("signed_amount") or 0))
         for m in rows(
             db().table("treasury_movements")
             .select("signed_amount")
-            .eq("supplier_invoice_id", inv["id"])
+            .eq("supplier_invoice_id", invoice_id)
             .eq("movement_type", "PAYMENT")
         )
     )
-    saldo = max(0, float(inv.get("total") or 0) - paid)
+
+
+def validate_supplier_payment(inv: dict[str, Any], amount: float, channel: str) -> str:
+    """Valida un pago a una factura de proveedor sin escribir nada. Devuelve el canal normalizado (CASH | BANK)."""
+    if amount <= 0:
+        raise bad_request("El monto debe ser mayor a 0")
+    saldo = max(0, float(inv.get("total") or 0) - _paid_amount(inv["id"]))
     if amount > saldo + 0.01:
         raise bad_request(f"El monto supera el saldo pendiente ({saldo})")
-
-    channel = (payload.get("channel") or "BANK").upper()
+    channel = (channel or "BANK").upper()
     if channel not in ("CASH", "BANK"):
         channel = "BANK"
-
     if channel == "CASH":
         available = cash_balance()
         if amount > available + 0.01:
             raise bad_request(f"Saldo de caja insuficiente para pagar {amount:.2f} (disponible {available:.2f})")
+    return channel
 
+
+def register_supplier_payment(
+    inv: dict[str, Any], amount: float, channel: str, payload: dict[str, Any], actor: AuthUser, meta: RequestMeta,
+    *, audit_reference: str | None = None,
+) -> dict[str, Any]:
+    """Único punto que registra un pago a proveedor (movimiento PAYMENT en caja o bancos).
+
+    Lo usan "Cuentas por pagar" y la aprobación de la recepción en Kardex, de modo que el egreso tenga siempre
+    las mismas validaciones (saldo pendiente, saldo de caja) y el mismo formato.
+    """
+    channel = validate_supplier_payment(inv, amount, channel)
     bank_account_id = payload.get("bank_account_id")
     if channel == "BANK" and not bank_account_id:
         acc = first(db().table("bank_accounts").select("id").eq("is_active", True))
@@ -292,12 +298,30 @@ def pay_payable(invoice_id: str, payload: dict[str, Any], actor: AuthUser, meta:
         "reconciliation_status": "RECONCILED" if channel == "CASH" else "PENDING",
         "created_by_user_id": actor.id,
     }
-    execute(db().table("treasury_movements").insert(row))
+    created = execute(db().table("treasury_movements").insert(row)).data[0]
     record(
-        actor.actor, action="CREATE", module_key=MODULE_AP, entity_type="TreasuryMovement",
-        entity_id=None, reference=code,
-        description=f"Pago {amount} · {inv.get('series_number')}", meta=meta,
+        actor.actor, action="CREATE", module_key=MODULE_CASH if channel == "CASH" else MODULE_AP,
+        entity_type="TreasuryMovement", entity_id=created.get("id"), reference=audit_reference or code,
+        description=f"Egreso {'de caja' if channel == 'CASH' else 'bancario'} {amount:.2f} · {row['description']} ({code})",
+        meta=meta,
     )
+    return created
+
+
+def delete_payment(movement_id: str) -> None:
+    """Revierte un pago recién registrado (compensación si falla un paso posterior de la misma operación)."""
+    execute(db().table("treasury_movements").delete().eq("id", movement_id))
+
+
+def pay_payable(invoice_id: str, payload: dict[str, Any], actor: AuthUser, meta: RequestMeta) -> dict[str, Any]:
+    inv = first(db().table("supplier_invoices").select("*").eq("id", invoice_id))
+    if not inv:
+        inv = first(db().table("supplier_invoices").select("*").eq("series_number", invoice_id))
+    if not inv:
+        raise not_found("Factura de proveedor no encontrada")
+
+    amount = abs(float(payload.get("amount") or 0))
+    register_supplier_payment(inv, amount, payload.get("channel") or "BANK", payload, actor, meta)
     items = list_payables(limit=200, offset=0)["items"]
     for i in items:
         if i["id"] == inv["id"]:

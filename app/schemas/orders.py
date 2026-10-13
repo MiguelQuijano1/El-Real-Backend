@@ -30,6 +30,10 @@ class SaleOrderCreate(ApiModel):
     party_contact: str | None = None
     party_email: str | None = None
     origin: str | None = None  # cotización u origen legible
+    # Datos de entrega elegidos en el modal de venta: se guardan en el evento del paso 0 y precargan confirmación/despacho
+    carrier: str | None = Field(default=None, max_length=120)
+    delivery_date: str | None = Field(default=None, max_length=10)
+    delivery_address: str | None = Field(default=None, max_length=300)
 
 
 class CompleteStepIn(ApiModel):

@@ -131,13 +131,19 @@ def list_kardex(
     if warehouse_id:
         query = query.eq("warehouse_id", warehouse_id)
     res = execute(query.order("occurred_at", desc=True).order("id", desc=True).range(offset, offset + limit - 1))
+    balances = _running_balances()
+    user_ids = {m.get("created_by_user_id") for m in res.data or [] if m.get("created_by_user_id")}
+    names: dict[str, str] = {}
+    if user_ids:
+        for u in rows(db().table("users").select("id, full_name").in_("id", list(user_ids))):
+            names[u["id"]] = u.get("full_name") or ""
     items = []
-    # Para saldo: cargar movimientos más antiguos y calcular running — simplificado: saldo solo del lote actual
     for m in res.data or []:
         p = m.get("product") or {}
         w = m.get("warehouse") or {}
         delta = float(m.get("quantity_delta") or 0)
         tipo = TYPE_UI.get(m.get("movement_type") or "", m.get("movement_type") or "")
+        after = balances.get(m["id"])
         row = {
             "id": m["id"],
             "fecha": str(m.get("occurred_at") or "")[:19].replace("T", " "),
@@ -150,15 +156,42 @@ def list_kardex(
             "delta": delta,
             "costo": float(m.get("unit_cost") or 0),
             "ref": m.get("reference_snapshot") or "",
+            "resp": names.get(m.get("created_by_user_id") or "", ""),
+            "antes": round(after - delta, 3) if after is not None else None,
+            "saldo": after,
             "productId": m.get("product_id"),
             "warehouseId": m.get("warehouse_id"),
         }
         if q:
             term = q.strip().lower()
-            if term not in f"{row['sku']} {row['prod']} {row['ref']} {row['alm']}".lower():
+            if term not in f"{row['sku']} {row['prod']} {row['ref']} {row['alm']} {row['resp']}".lower():
                 continue
         items.append(row)
     return {"items": items, "total": res.count or len(items), "limit": limit, "offset": offset}
+
+
+def _running_balances() -> dict[str, float]:
+    """Saldo posterior de cada movimiento por (producto, almacén), acumulando en orden cronológico.
+
+    Se calcula con TODOS los movimientos para que el saldo no dependa de la página que se pide.
+    """
+    balance: dict[tuple[str, str], float] = defaultdict(float)
+    out: dict[str, float] = {}
+    start, page = 0, 1000
+    while True:
+        batch = rows(
+            db().table("inventory_movements")
+            .select("id, product_id, warehouse_id, quantity_delta")
+            .order("occurred_at").order("id")
+            .range(start, start + page - 1)
+        )
+        for m in batch:
+            key = (m["product_id"], m["warehouse_id"])
+            balance[key] = round(balance[key] + float(m.get("quantity_delta") or 0), 3)
+            out[m["id"]] = balance[key]
+        if len(batch) < page:
+            return out
+        start += page
 
 
 # --------------------------------------------------------------------------- transfers

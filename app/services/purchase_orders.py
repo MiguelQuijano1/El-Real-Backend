@@ -1,17 +1,24 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from app.core.errors import bad_request, not_found
+from app.core.errors import bad_request, conflict, forbidden, not_found
 from app.repositories.client import db, execute, find_by_id_or_code, first
 from app.services.costing import get_average_cost, product_stock_total, set_average_cost, weighted_average
+from app.services.permissions import role_has_permission
+from app.services.finance import cash_balance, register_supplier_payment, delete_payment
 from app.security.deps import AuthUser
 from app.services.audit import RequestMeta, record
 
 MODULE = "purchase-orders"
+MODULE_RECEIPTS = "goods-receipts"
 KIND = "PURCHASE"
 MAX_STEP = 5
+# Pasos de la orden de compra (current_step = pasos completados):
+#   1 registrada · 2 orden lista para recepción (así nace) · 3 recibida · 4 factura registrada · 5 pagada.
+# La orden NO pide aprobación al crearse: nace en el paso 2 y se aprueba/recibe en Kardex (approve_receipt).
+STEP_READY = 2
 
 
 def _next_code(prefix: str) -> str:
@@ -43,7 +50,16 @@ def _embed() -> str:
     )
 
 
-def _serialize(row: dict[str, Any], seller_name: str = "") -> dict[str, Any]:
+def _event_user_names(rows_: list[dict[str, Any]]) -> dict[str, str]:
+    """Nombre de quien completó cada paso (para el historial de la orden)."""
+    ids = {ev.get("completed_by_user_id") for r in rows_ for ev in (r.get("events") or []) if ev.get("completed_by_user_id")}
+    if not ids:
+        return {}
+    found = execute(db().table("users").select("id, full_name").in_("id", list(ids))).data or []
+    return {u["id"]: u.get("full_name") or "" for u in found}
+
+
+def _serialize(row: dict[str, Any], seller_name: str = "", user_names: dict[str, str] | None = None) -> dict[str, Any]:
     lines = sorted(row.get("lines") or [], key=lambda x: x.get("line_no", 0))
     events = sorted(row.get("events") or [], key=lambda x: x.get("step_no", 0))
     supplier = row.get("supplier") or {}
@@ -60,7 +76,8 @@ def _serialize(row: dict[str, Any], seller_name: str = "") -> dict[str, Any]:
         else:
             forms[key] = {}
         docs[key] = str(ev.get("generated_reference") or "")
-        log[key] = {"who": "", "at": ev.get("completed_at"), "userId": ev.get("completed_by_user_id")}
+        uid = ev.get("completed_by_user_id")
+        log[key] = {"who": (user_names or {}).get(uid or "", ""), "at": ev.get("completed_at"), "userId": uid}
     terms_days = int(row.get("payment_terms_days") or 0)
     party = {
         "code": supplier.get("code") or "",
@@ -122,7 +139,8 @@ def list_purchase_orders(*, q: str | None = None, cancelled: bool | None = None,
     if seller_ids:
         for u in execute(db().table("users").select("id, full_name").in_("id", list(seller_ids))).data or []:
             names[u["id"]] = u.get("full_name") or ""
-    items = [_serialize(r, names.get(r.get("seller_user_id") or "")) for r in rows]
+    actors = _event_user_names(rows)
+    items = [_serialize(r, names.get(r.get("seller_user_id") or ""), actors) for r in rows]
     return {"items": items, "total": res.count or 0, "limit": limit, "offset": offset}
 
 
@@ -134,7 +152,7 @@ def get_purchase_order(order_id_or_code: str) -> dict[str, Any]:
     if row.get("seller_user_id"):
         u = first(db().table("users").select("full_name").eq("id", row["seller_user_id"]))
         seller_name = (u or {}).get("full_name") or ""
-    return _serialize(row, seller_name)
+    return _serialize(row, seller_name, _event_user_names([row]))
 
 
 def create_purchase_order(payload: dict[str, Any], actor: AuthUser, meta: RequestMeta) -> dict[str, Any]:
@@ -169,7 +187,7 @@ def create_purchase_order(payload: dict[str, Any], actor: AuthUser, meta: Reques
         "party_email": payload.get("party_email") or supplier.get("email"),
         "payment_terms_days": terms_days,
         "tax_rate": float(tax_rate),
-        "current_step": 1,
+        "current_step": STEP_READY,
         "is_cancelled": False,
     }
     created = execute(db().table("business_orders").insert(order_row)).data[0]
@@ -198,12 +216,18 @@ def create_purchase_order(payload: dict[str, Any], actor: AuthUser, meta: Reques
         "generated_reference": origin,
         "note": origin,
     }
-    try:
-        execute(db().table("order_step_events").insert({**event, "form_data": {}}))
-    except Exception:
-        execute(db().table("order_step_events").insert(event))
+    # Paso 1 (orden registrada): la orden queda lista para recepción, sin aprobación aparte.
+    ready_event = {**event, "step_no": 1, "generated_reference": code, "note": "Orden de compra registrada"}
+    for ev in (event, ready_event):
+        try:
+            execute(db().table("order_step_events").insert({**ev, "form_data": {}}))
+        except Exception:
+            execute(db().table("order_step_events").insert(ev))
+    total = sum(float(ln["quantity"]) * float(ln["unit_price"]) for ln in lines_in) * (1 + float(tax_rate))
     record(actor.actor, action="CREATE", module_key=MODULE, entity_type="BusinessOrder",
-           entity_id=order_id, reference=code, description=f"Orden de compra · {order_row['party_name']}", meta=meta)
+           entity_id=order_id, reference=code,
+           description=f"Orden de compra creada · {order_row['party_name']} · S/ {total:.2f} · pendiente de recepción en Kardex",
+           meta=meta)
     return get_purchase_order(order_id)
 
 
@@ -231,7 +255,8 @@ def complete_step(order_id_or_code: str, payload: dict[str, Any], actor: AuthUse
             patch["payment_terms_days"] = _days_from_term(values_str["cond"])
         generated = generated or order["code"]
     elif step == 2:
-        generated = generated or _create_goods_receipt(order, values_str, actor)
+        # La recepción, la factura con su archivo y el egreso se aprueban juntos en Kardex (approve_receipt).
+        raise bad_request("La recepción de mercadería se aprueba en Kardex")
     elif step == 3:
         generated = generated or _create_supplier_invoice(order, values_str, actor)
     elif step == 4:
@@ -258,7 +283,19 @@ def complete_step(order_id_or_code: str, payload: dict[str, Any], actor: AuthUse
 
 
 
-def _post_receipt_movements(order: dict[str, Any], receipt_id: str | None, warehouse_id: str, actor: AuthUser) -> None:
+def _restore_costs(restore: list[tuple[str, float]]) -> None:
+    for pid, old_avg in reversed(restore):
+        set_average_cost(pid, old_avg)
+
+
+def _post_receipt_movements(
+    order: dict[str, Any], receipt_id: str | None, warehouse_id: str, actor: AuthUser,
+    received: dict[str, float] | None = None,
+) -> list[tuple[str, float]]:
+    """Entradas de inventario de la recepción. `received`: línea → cantidad recibida (por defecto, la pedida).
+
+    Devuelve los costos promedio anteriores para que el llamador los restituya si un paso posterior falla.
+    """
     lines = execute(db().table("order_lines").select("*").eq("order_id", order["id"]).order("line_no")).data or []
     now = datetime.now(timezone.utc).isoformat()
     restore: list[tuple[str, float]] = []  # costos promedio a devolver si una línea posterior falla
@@ -266,7 +303,10 @@ def _post_receipt_movements(order: dict[str, Any], receipt_id: str | None, wareh
         for ln in lines:
             if not ln.get("product_id"):
                 continue  # línea sin producto del catálogo: no mueve stock
-            pid, qty, cost = ln["product_id"], float(ln["quantity"]), float(ln.get("unit_price") or 0)
+            pid, cost = ln["product_id"], float(ln.get("unit_price") or 0)
+            qty = float(received[ln["id"]]) if received and ln["id"] in received else float(ln["quantity"])
+            if qty <= 0:
+                continue  # nada recibido de esta línea
             old_avg = get_average_cost(pid)
             new_avg = weighted_average(product_stock_total(pid), old_avg, qty, cost)  # antes de insertar la entrada
             execute(db().table("inventory_movements").insert({
@@ -285,42 +325,9 @@ def _post_receipt_movements(order: dict[str, Any], receipt_id: str | None, wareh
                 set_average_cost(pid, new_avg)
                 restore.append((pid, old_avg))
     except Exception:
-        for pid, old_avg in reversed(restore):
-            set_average_cost(pid, old_avg)
+        _restore_costs(restore)
         raise
-
-
-def _create_goods_receipt(order: dict[str, Any], values: dict[str, str], actor: AuthUser) -> str:
-    receipt_number = _next_code("NI")
-    condition = "CONFORMING"
-    if values.get("est") and "observ" in values["est"].lower():
-        condition = "OBSERVATIONS"
-    warehouse_id = order["warehouse_id"]
-    if values.get("alm"):
-        wh = first(db().table("warehouses").select("id").eq("name", values["alm"]))
-        if wh:
-            warehouse_id = wh["id"]
-            execute(db().table("business_orders").update({"warehouse_id": warehouse_id}).eq("id", order["id"]))
-    received_at = values.get("fr") or datetime.now(timezone.utc).date().isoformat()
-    row = {
-        "order_id": order["id"],
-        "receipt_number": receipt_number,
-        "received_at": received_at if "T" in received_at else f"{received_at}T12:00:00+00:00",
-        "supplier_guide_reference": values.get("gr") or None,
-        "warehouse_id": warehouse_id,
-        "condition": condition,
-        "observations": values.get("obs") or None,
-        "received_by_user_id": actor.id,
-    }
-    receipt_id = execute(db().table("goods_receipts").insert(row)).data[0]["id"]
-    try:
-        _post_receipt_movements(order, receipt_id, warehouse_id, actor)
-    except Exception:
-        # No dejar una nota de ingreso ni entradas a medias: el paso no avanza y se puede reintentar.
-        execute(db().table("inventory_movements").delete().eq("goods_receipt_id", receipt_id))
-        execute(db().table("goods_receipts").delete().eq("id", receipt_id))
-        raise
-    return f"Ingreso {receipt_number}"
+    return restore
 
 
 def _create_supplier_invoice(order: dict[str, Any], values: dict[str, str], actor: AuthUser) -> str:
@@ -349,6 +356,225 @@ def _create_supplier_invoice(order: dict[str, Any], values: dict[str, str], acto
     # Sin try/except: si la factura no se guarda, el paso no debe avanzar.
     execute(db().table("supplier_invoices").insert(row))
     return f"Factura {series_number}"
+
+
+def _money(v: Any) -> float:
+    try:
+        return round(float(v), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _insert_event(order_id: str, step_no: int, actor: AuthUser, reference: str, values: dict[str, str], note: str | None = None) -> None:
+    event = {
+        "order_id": order_id,
+        "step_no": step_no,
+        "completed_by_user_id": actor.id,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "generated_reference": reference,
+        "note": note,
+    }
+    try:
+        execute(db().table("order_step_events").insert({**event, "form_data": values}))
+    except Exception:
+        execute(db().table("order_step_events").insert(event))
+
+
+def approve_receipt(order_id_or_code: str, payload: dict[str, Any], actor: AuthUser, meta: RequestMeta) -> dict[str, Any]:
+    """Aprueba en Kardex la recepción de una orden de compra, como UNA sola operación:
+
+      nota de ingreso + entradas de inventario  →  factura del proveedor (con archivo)  →  pago (egreso de caja o banco).
+
+    - Solo corresponde a órdenes en el paso 2 (listas para recepción); el paso se "reclama" con un UPDATE condicional,
+      así que una segunda petición simultánea o repetida recibe 409 y no duplica entradas ni pagos.
+    - Todo lo validable se valida antes de escribir (cantidades, factura duplicada, saldo de caja).
+    - Si un paso falla, se revierten los anteriores y la orden vuelve al paso 2.
+    - El pago se registra aquí solo cuando la condición de pago es Contado (o `pay_now`); a crédito queda la cuenta por
+      pagar pendiente (paso 4) y el egreso se hace cuando se paga la factura.
+    """
+    order = find_by_id_or_code("business_orders", order_id_or_code, kind=KIND)
+    if not order:
+        raise not_found("Orden de compra no encontrada")
+    if order.get("is_cancelled"):
+        raise bad_request("La orden está anulada")
+    step = int(order.get("current_step") or 1)
+    # Las órdenes anteriores que quedaron «por aprobar» (paso 1) se tratan como listas para recepción: ya no hay aprobación aparte.
+    if step > STEP_READY:
+        raise conflict("La orden ya fue recibida; no se puede aprobar la recepción otra vez")
+
+    order_lines = execute(db().table("order_lines").select("*").eq("order_id", order["id"]).order("line_no")).data or []
+    if not order_lines:
+        raise bad_request("La orden no tiene productos")
+
+    # --- cantidades recibidas vs. pedidas
+    given: dict[str, float] = {}
+    for item in payload.get("lines") or []:
+        if item.get("sku") is not None and item.get("quantity") is not None:
+            given[str(item["sku"])] = float(item["quantity"])
+    received: dict[str, float] = {}
+    differences: list[str] = []
+    for ln in order_lines:
+        ordered = float(ln["quantity"])
+        qty = given.get(str(ln.get("sku_snapshot")), ordered)
+        if qty < 0 or qty > ordered + 1e-9:
+            raise bad_request(f"La cantidad recibida de {ln.get('name_snapshot')} debe estar entre 0 y {ordered:g}")
+        received[ln["id"]] = qty
+        if abs(qty - ordered) > 1e-9:
+            differences.append(f"{ln.get('sku_snapshot')}: recibido {qty:g} de {ordered:g}")
+    if not any(q > 0 for q in received.values()):
+        raise bad_request("Indica al menos una cantidad recibida mayor a 0")
+
+    # --- factura del proveedor
+    tax_rate = float(order.get("tax_rate") if order.get("tax_rate") is not None else 0.18)
+    ordered_total = _money(sum(float(ln["quantity"]) * float(ln["unit_price"]) for ln in order_lines) * (1 + tax_rate))
+    received_total = _money(sum(received[ln["id"]] * float(ln["unit_price"]) for ln in order_lines) * (1 + tax_rate))
+    series_number = str(payload.get("invoice_number") or "").strip()
+    invoice_type = str(payload.get("invoice_type") or "Factura").strip() or "Factura"
+    invoice_label = f"{invoice_type} {series_number}"
+    if not series_number:
+        raise bad_request("Ingresa la serie y número de la factura del proveedor")
+    invoice_total = _money(payload.get("invoice_total")) or received_total
+    if invoice_total <= 0:
+        raise bad_request("El monto de la factura debe ser mayor a 0")
+    if first(db().table("supplier_invoices").select("id").eq("supplier_id", order["supplier_id"]).eq("series_number", series_number)):
+        raise bad_request(f"La factura {series_number} ya está registrada para este proveedor")
+    if first(db().table("supplier_invoices").select("id").eq("order_id", order["id"])):
+        raise conflict("La orden ya tiene una factura registrada")
+    # El archivo del comprobante es opcional; si se envía, debe existir.
+    document_id = payload.get("document_id") or None
+    if document_id and not first(db().table("documents").select("id").eq("id", document_id).is_("deleted_at", "null")):
+        raise bad_request("El archivo del comprobante no existe o fue eliminado")
+
+    # --- pago (egreso)
+    terms_days = int(order.get("payment_terms_days") or 0)
+    pay_now = payload.get("pay_now")
+    pay_now = (terms_days <= 0) if pay_now is None else bool(pay_now)
+    channel = str(payload.get("payment_channel") or "CASH").upper()
+    channel = channel if channel in ("CASH", "BANK") else "CASH"
+    # El egreso es una operación de Finanzas: quien aprueba la recepción también debe poder registrar pagos.
+    if pay_now and not actor.is_admin and not role_has_permission(actor.role_id, "payables", "edit"):
+        raise forbidden("No tienes permiso para registrar el pago de la factura (Cuentas por pagar)")
+    if pay_now and channel == "CASH":
+        available = cash_balance()
+        if invoice_total > available + 0.01:
+            raise bad_request(f"Saldo de caja insuficiente para pagar {invoice_total:.2f} (disponible {available:.2f})")
+
+    warehouse_id = order["warehouse_id"]
+    wh_name = str(payload.get("warehouse") or "").strip()
+    if wh_name:
+        wh = first(db().table("warehouses").select("id").eq("name", wh_name))
+        if not wh:
+            raise bad_request("Almacén no encontrado")
+        warehouse_id = wh["id"]
+
+    # --- reclamar el paso (UPDATE condicional): solo una petición puede continuar
+    claimed = execute(
+        db().table("business_orders").update({"current_step": STEP_READY + 1, "warehouse_id": warehouse_id})
+        .eq("id", order["id"]).eq("current_step", step).eq("is_cancelled", False)
+    ).data
+    if not claimed:
+        raise conflict("La orden ya fue procesada por otra operación")
+
+    # Emisión = fecha de recepción; vencimiento = emisión + días de la condición de pago de la orden (Contado: el mismo día).
+    issued_at = str(payload.get("invoice_issued_at") or payload.get("received_at") or datetime.now(timezone.utc).date().isoformat())[:10]
+    due_at = str(payload.get("invoice_due_at") or (date.fromisoformat(issued_at) + timedelta(days=max(terms_days, 0))).isoformat())[:10]
+
+    done: dict[str, Any] = {"restore": []}
+    try:
+        receipt_number = _next_code("NI")
+        condition = "OBSERVATIONS" if (differences or payload.get("observations")) else "CONFORMING"
+        received_at = str(payload.get("received_at") or datetime.now(timezone.utc).date().isoformat())
+        observations = "; ".join(filter(None, [str(payload.get("observations") or "").strip(), "Diferencias: " + ", ".join(differences) if differences else ""]))
+        receipt = execute(db().table("goods_receipts").insert({
+            "order_id": order["id"],
+            "receipt_number": receipt_number,
+            "received_at": received_at if "T" in received_at else f"{received_at}T12:00:00+00:00",
+            "supplier_guide_reference": payload.get("supplier_guide") or None,
+            "warehouse_id": warehouse_id,
+            "condition": condition,
+            "observations": observations or None,
+            "received_by_user_id": actor.id,
+        })).data[0]
+        done["receipt_id"] = receipt["id"]
+        done["restore"] = _post_receipt_movements(order, receipt["id"], warehouse_id, actor, received)
+
+        invoice = execute(db().table("supplier_invoices").insert({
+            "order_id": order["id"],
+            "supplier_id": order["supplier_id"],
+            "series_number": series_number,
+            "issued_at": issued_at,
+            "due_at": due_at,
+            "currency": "PEN",
+            "total": invoice_total,
+            "validation_status": "MATCHES_ORDER_RECEIPT" if (not differences and abs(invoice_total - ordered_total) <= 0.01) else "HAS_DIFFERENCES",
+            "created_by_user_id": actor.id,
+        })).data[0]
+        done["invoice_id"] = invoice["id"]
+        if document_id:  # vincula el archivo subido con la orden y el proveedor
+            execute(db().table("documents").update({
+                "related_order_id": order["id"], "related_supplier_id": order["supplier_id"], "category": "INVOICE",
+            }).eq("id", document_id))
+
+        payment = None
+        if pay_now:
+            payment = register_supplier_payment(
+                invoice, invoice_total, channel,
+                {
+                    "bank_account_id": payload.get("bank_account_id"),
+                    "reference": payload.get("payment_reference") or order["code"],
+                    "description": f"Pago {order['code']} · {order.get('party_name') or ''} · {invoice_label}",
+                },
+                actor, meta, audit_reference=order["code"],
+            )
+            done["payment_id"] = payment["id"]
+
+        final_step = 5 if payment else 4
+        _insert_event(order["id"], 2, actor, f"Ingreso {receipt_number}", {
+            "fr": received_at[:10], "gr": str(payload.get("supplier_guide") or ""), "alm": wh_name or "",
+            "est": "Con observaciones" if condition == "OBSERVATIONS" else "Conforme", "obs": observations,
+            "lines": "; ".join(f"{ln.get('sku_snapshot')}={received[ln['id']]:g}/{float(ln['quantity']):g}" for ln in order_lines),
+        })
+        _insert_event(order["id"], 3, actor, invoice_label, {
+            "tipo": invoice_type, "num": series_number, "fe": issued_at, "fv": due_at,
+            "mon": f"{invoice_total:.2f}", "document": str(document_id or ""),
+        })
+        if payment:
+            _insert_event(order["id"], 4, actor, f"Pago {payment.get('code')}", {
+                "mon": f"{invoice_total:.2f}", "med": "Efectivo" if channel == "CASH" else "Transferencia",
+                "cta": "Caja" if channel == "CASH" else "Banco", "op": str(payload.get("payment_reference") or order["code"]),
+            })
+        execute(db().table("business_orders").update({"current_step": final_step}).eq("id", order["id"]))
+    except Exception:
+        # Compensación: deshacer lo escrito (de atrás hacia adelante) y devolver la orden al paso 2.
+        def _safe(fn):  # un fallo al revertir no debe ocultar el error original
+            try:
+                fn()
+            except Exception:  # noqa: BLE001
+                pass
+        if done.get("payment_id"):
+            _safe(lambda: delete_payment(done["payment_id"]))
+        _safe(lambda: execute(db().table("order_step_events").delete().eq("order_id", order["id"]).in_("step_no", [2, 3, 4])))
+        if done.get("invoice_id"):
+            _safe(lambda: execute(db().table("supplier_invoices").delete().eq("id", done["invoice_id"])))
+        if done.get("receipt_id"):
+            _safe(lambda: execute(db().table("inventory_movements").delete().eq("goods_receipt_id", done["receipt_id"])))
+            _safe(lambda: execute(db().table("goods_receipts").delete().eq("id", done["receipt_id"])))
+        _safe(lambda: _restore_costs(done["restore"]))
+        _safe(lambda: execute(db().table("business_orders").update({"current_step": step, "warehouse_id": order["warehouse_id"]}).eq("id", order["id"])))
+        record(actor.actor, action="EDIT", module_key=MODULE_RECEIPTS, entity_type="BusinessOrder", entity_id=order["id"],
+               reference=order["code"], description="Aprobación de recepción fallida; no se registró ningún cambio",
+               meta=meta, result="FAILURE")
+        raise
+
+    record(actor.actor, action="EDIT", module_key=MODULE_RECEIPTS, entity_type="GoodsReceipt", entity_id=done["receipt_id"],
+           reference=order["code"],
+           description=f"Recepción aprobada {receipt_number} · {order['code']} · ingreso de {sum(received.values()):g} unidades"
+                       + (f" · {'; '.join(differences)}" if differences else ""),
+           meta=meta)
+    record(actor.actor, action="CREATE", module_key=MODULE_RECEIPTS, entity_type="SupplierInvoice", entity_id=done["invoice_id"],
+           reference=order["code"], description=f"{invoice_label} registrada · S/ {invoice_total:.2f} · {order['code']}",
+           meta=meta)
+    return get_purchase_order(order["id"])
 
 
 def cancel_purchase_order(order_id_or_code: str, actor: AuthUser, meta: RequestMeta, reason: str | None = None) -> dict[str, Any]:

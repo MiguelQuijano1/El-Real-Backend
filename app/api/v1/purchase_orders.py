@@ -54,3 +54,13 @@ def cancel_order(
 ):
     reason = payload.reason if payload else None
     return svc.cancel_purchase_order(order_id, actor, request_meta(request), reason=reason)
+
+@router.post("/{order_id}/approve-receipt")
+def approve_receipt(
+    order_id: str,
+    request: Request,
+    payload: sch.ApproveReceiptIn = Body(...),
+    actor: AuthUser = Depends(require_permission("goods-receipts", "approve")),
+):
+    """Kardex: aprueba la recepción (ingreso a inventario), registra la factura con su archivo y el egreso."""
+    return svc.approve_receipt(order_id, payload.model_dump(mode="json"), actor, request_meta(request))

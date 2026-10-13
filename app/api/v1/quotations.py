@@ -60,9 +60,16 @@ def status_(
 
 
 @router.post("/{quotation_id}/convert")
-def convert_(quotation_id: str, request: Request, actor: AuthUser = Depends(_create)):
+def convert_(
+    quotation_id: str,
+    request: Request,
+    payload: sch.QuotationConvertIn | None = Body(default=None),
+    actor: AuthUser = Depends(_create),
+):
     # Convertir requiere crear orden de venta
-    return svc.convert_quotation(quotation_id, actor, request_meta(request))
+    return svc.convert_quotation(
+        quotation_id, actor, request_meta(request), customer_id=payload.customer_id if payload else None
+    )
 
 
 @router.delete("/{quotation_id}", status_code=204)

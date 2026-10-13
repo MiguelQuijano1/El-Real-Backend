@@ -195,7 +195,7 @@ def create_sale_order(payload: dict[str, Any], actor: AuthUser, meta: RequestMet
 
     party_name = payload.get("party_name") or customer.get("legal_name")
     party_tax_id = payload.get("party_tax_id") or customer.get("document_number")
-    party_address = payload.get("party_address") or customer.get("fiscal_address")
+    party_address = payload.get("delivery_address") or payload.get("party_address") or customer.get("fiscal_address")
     party_contact = payload.get("party_contact") or customer.get("contact_name")
     party_email = payload.get("party_email") or customer.get("billing_email")
 
@@ -247,9 +247,15 @@ def create_sale_order(payload: dict[str, Any], actor: AuthUser, meta: RequestMet
         "generated_reference": origin,
         "note": origin,
     }
+    # Datos de entrega elegidos en el modal de venta (transportista, fecha y dirección de entrega).
+    creation_form = {
+        k: str(v)
+        for k, v in (("tra", payload.get("carrier")), ("ent", payload.get("delivery_date")), ("dir", payload.get("delivery_address")))
+        if v
+    }
     # form_data si la columna existe en la BD del usuario
     try:
-        execute(db().table("order_step_events").insert({**event, "form_data": {}}))
+        execute(db().table("order_step_events").insert({**event, "form_data": creation_form}))
     except Exception:
         execute(db().table("order_step_events").insert(event))
 

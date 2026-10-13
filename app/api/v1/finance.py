@@ -15,7 +15,7 @@ def receivables_list(
     q: Annotated[str | None, Query(max_length=100)] = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
-    _: AuthUser = Depends(require_permission("ar", "view")),
+    _: AuthUser = Depends(require_permission("receivables", "view")),
 ):
     return svc.list_receivables(q=q, limit=limit, offset=offset)
 
@@ -25,7 +25,7 @@ def receivables_collect(
     invoice_id: str,
     request: Request,
     payload: sch.CollectIn = Body(...),
-    actor: AuthUser = Depends(require_permission("ar", "edit")),
+    actor: AuthUser = Depends(require_permission("receivables", "edit")),
 ):
     return svc.collect_receivable(invoice_id, payload.model_dump(mode="json"), actor, request_meta(request))
 
@@ -36,7 +36,7 @@ def payables_list(
     q: Annotated[str | None, Query(max_length=100)] = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
-    _: AuthUser = Depends(require_permission("ap", "view")),
+    _: AuthUser = Depends(require_permission("payables", "view")),
 ):
     return svc.list_payables(q=q, limit=limit, offset=offset)
 
@@ -46,7 +46,7 @@ def payables_pay(
     invoice_id: str,
     request: Request,
     payload: sch.PayIn = Body(...),
-    actor: AuthUser = Depends(require_permission("ap", "edit")),
+    actor: AuthUser = Depends(require_permission("payables", "edit")),
 ):
     return svc.pay_payable(invoice_id, payload.model_dump(mode="json"), actor, request_meta(request))
 

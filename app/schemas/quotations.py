@@ -9,7 +9,8 @@ from app.schemas.orders import OrderLineIn
 
 
 class QuotationCreate(ApiModel):
-    customer_id: str
+    # Opcional: se puede cotizar sin cliente y asignarlo al convertir en orden de venta.
+    customer_id: str | None = None
     seller_user_id: str | None = None
     warehouse_id: str | None = None
     valid_until: date | None = None
@@ -27,6 +28,10 @@ class QuotationUpdate(ApiModel):
     lines: list[OrderLineIn] | None = None
     status: str | None = Field(default=None, pattern="^(DRAFT|SENT|APPROVED|REJECTED)$")
     rejected_reason: str | None = None
+
+
+class QuotationConvertIn(ApiModel):
+    customer_id: str | None = None
 
 
 class QuotationStatusIn(ApiModel):

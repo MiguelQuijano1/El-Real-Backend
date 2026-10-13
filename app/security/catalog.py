@@ -13,11 +13,11 @@ PERMISSION_GROUPS = [
     {"group": "Compras", "modules": [
         {"key": "purchase-requests", "label": "Solicitudes"},
         {"key": "purchase-orders", "label": "Órdenes de compra"},
-        {"key": "goods-receipts", "label": "Recepción"},
     ]},
     {"group": "Inventario", "modules": [
         {"key": "stock", "label": "Stock por almacén"},
-        {"key": "kardex", "label": "Kardex"},
+        {"key": "goods-receipts", "label": "Kardex"},
+        {"key": "kardex", "label": "Movimientos Kardex"},
         {"key": "transfers", "label": "Transferencias"},
         {"key": "adjustments", "label": "Ajustes"},
     ]},
