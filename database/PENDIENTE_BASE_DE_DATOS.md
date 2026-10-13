@@ -83,6 +83,10 @@ El rol Administrador no necesita cambios.
 - **Cotización vencida:** no se guarda un estado nuevo. Una cotización en Borrador/Enviada/Aprobada cuya fecha
   «Válida hasta» ya pasó se muestra como **Vencida** (se calcula al leer). Al extender la fecha, vuelve a estar vigente.
   No requiere ningún cambio en la base ni tareas programadas.
+- **Venta al contado sin pagar:** la fecha límite de pago se guarda en `order_step_events.form_data` (clave `lim`) del paso de creación.
+  Una orden de venta sin aprobar cuya fecha límite pasó se anula sola (al listar o al intentar aprobarla), con auditoría «Sistema».
+  Requiere que la columna `form_data` de `order_step_events` exista (ya la usa el resto del flujo); no hay SQL nuevo.
+  Las ventas a crédito no se anulan: si no pagan quedan «Vencido» en Cuentas por cobrar.
 - **Índice existente:** `quotations_idx_2 (status, valid_until)` ya cubre las consultas por vigencia.
 - **Recepción parcial:** la cantidad pendiente no se vuelve a recibir en la misma orden (queda «con observaciones»).
 - **Comprobante del proveedor:** el tipo (Factura, Boleta, etc.) se guarda en el evento del paso de la orden,

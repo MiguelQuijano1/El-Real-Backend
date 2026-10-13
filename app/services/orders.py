@@ -1,18 +1,31 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
 from app.core.errors import bad_request, not_found
-from app.repositories.client import db, execute, find_by_id_or_code, first
+from app.repositories.client import db, execute, find_by_id_or_code, first, rows
 from app.services.costing import get_average_cost
 from app.security.deps import AuthUser
-from app.services.audit import RequestMeta, record
+from app.services.audit import Actor, RequestMeta, record
 
 MODULE = "sales-orders"
 KIND_SALE = "SALE"
 MAX_STEP = 5  # 1=creada … 5=cobrada
+
+_LIMA = timezone(timedelta(hours=-5))
+
+
+def is_past_deadline(limit: Any, today: date | None = None) -> bool:
+    """La fecha límite de pago sigue vigente durante todo ese día; vence al día siguiente."""
+    if not limit:
+        return False
+    try:
+        d = date.fromisoformat(str(limit)[:10])
+    except ValueError:
+        return False
+    return d < (today or datetime.now(_LIMA).date())
 
 
 def _next_code(prefix: str, year: int | None = None) -> str:
@@ -125,6 +138,112 @@ def _serialize(row: dict[str, Any], seller_name: str | None = None) -> dict[str,
     }
 
 
+def credit_problem(limit: float, used: float, total: float) -> str | None:
+    """Motivo por el que una venta a crédito no cabe en la línea del cliente (None si cabe)."""
+    if limit <= 0:
+        return "El cliente no tiene línea de crédito: la venta debe ser al contado"
+    available = round(limit - used, 2)
+    if total - available > 0.005:
+        return (
+            f"La venta (S/ {total:,.2f}) supera el crédito disponible del cliente "
+            f"(S/ {max(available, 0):,.2f} de una línea de S/ {limit:,.2f})"
+        )
+    return None
+
+
+def customer_credit_used(customer_id: str) -> float:
+    """Crédito en uso: saldo por cobrar de sus facturas + ventas a crédito aún sin facturar."""
+    invoices = rows(
+        db()
+        .table("sales_invoices")
+        .select("id, total")
+        .eq("customer_id", customer_id)
+        .neq("tax_status", "VOIDED")
+        .neq("document_type", "CREDIT_NOTE")
+    )
+    ids = [i["id"] for i in invoices]
+    paid = 0.0
+    if ids:
+        for m in rows(
+            db()
+            .table("treasury_movements")
+            .select("signed_amount")
+            .eq("movement_type", "COLLECTION")
+            .in_("sales_invoice_id", ids)
+        ):
+            paid += abs(float(m.get("signed_amount") or 0))
+    owed = max(0.0, sum(float(i.get("total") or 0) for i in invoices) - paid)
+
+    open_orders = rows(
+        db()
+        .table("business_orders")
+        .select("id, tax_rate, payment_terms_days")
+        .eq("kind", KIND_SALE)
+        .eq("customer_id", customer_id)
+        .eq("is_cancelled", False)
+        .lte("current_step", 3)
+    )
+    pending = 0.0
+    for o in open_orders:
+        if int(o.get("payment_terms_days") or 0) <= 0:
+            continue
+        lines = rows(db().table("order_lines").select("quantity, unit_price").eq("order_id", o["id"]))
+        sub = sum(float(ln.get("quantity") or 0) * float(ln.get("unit_price") or 0) for ln in lines)
+        pending += sub * (1 + float(o.get("tax_rate") or 0.18))
+    return round(owed + pending, 2)
+
+
+def _pay_deadlines(order_ids: list[str]) -> dict[str, str]:
+    """Fecha límite de pago (`lim`) guardada en el evento de creación de cada orden."""
+    if not order_ids:
+        return {}
+    events = execute(
+        db().table("order_step_events").select("order_id, step_no, form_data").in_("order_id", order_ids)
+    ).data or []
+    out: dict[str, str] = {}
+    for e in events:
+        lim = (e.get("form_data") or {}).get("lim")
+        if lim:
+            out[e["order_id"]] = str(lim)
+    return out
+
+
+def expire_unpaid_orders(today: date | None = None) -> int:
+    """Anula las ventas al contado que siguen sin aprobar y pasaron su fecha límite de pago.
+
+    Aún no salió mercadería (el despacho ocurre al aprobar), así que anular no revierte nada. Se ejecuta al
+    listar órdenes y al intentar aprobar una; no hace falta ningún proceso programado.
+    """
+    open_orders = (
+        execute(
+            db()
+            .table("business_orders")
+            .select("id, code")
+            .eq("kind", KIND_SALE)
+            .eq("is_cancelled", False)
+            .lte("current_step", 1)
+        ).data
+        or []
+    )
+    if not open_orders:
+        return 0
+    deadlines = _pay_deadlines([o["id"] for o in open_orders])
+    expired = [o for o in open_orders if is_past_deadline(deadlines.get(o["id"]), today)]
+    now = datetime.now(timezone.utc).isoformat()
+    for o in expired:
+        execute(db().table("business_orders").update({"is_cancelled": True, "cancelled_at": now}).eq("id", o["id"]))
+        record(
+            Actor(user_name="Sistema"),
+            action="EDIT",
+            module_key=MODULE,
+            entity_type="BusinessOrder",
+            entity_id=o["id"],
+            reference=o["code"],
+            description=f"Orden de venta anulada por falta de pago · venció el {deadlines.get(o['id'])}",
+        )
+    return len(expired)
+
+
 def list_sale_orders(
     *,
     q: str | None = None,
@@ -132,6 +251,10 @@ def list_sale_orders(
     limit: int = 50,
     offset: int = 0,
 ) -> dict[str, Any]:
+    try:
+        expire_unpaid_orders()
+    except Exception:  # la lista no debe fallar si el barrido no pudo correr
+        pass
     query = (
         db()
         .table("business_orders")
@@ -193,6 +316,13 @@ def create_sale_order(payload: dict[str, Any], actor: AuthUser, meta: RequestMet
         settings = first(db().table("company_settings").select("tax_rate").eq("id", 1))
         tax_rate = (settings or {}).get("tax_rate", 0.18)
 
+    # Venta a crédito: debe caber en la línea de crédito del cliente (saldo por cobrar + ventas a crédito sin facturar).
+    if terms_days > 0:
+        order_total = sum(float(ln["quantity"]) * float(ln["unit_price"]) for ln in lines_in) * (1 + float(tax_rate))
+        problem = credit_problem(float(customer.get("credit_limit") or 0), customer_credit_used(customer_id), order_total)
+        if problem:
+            raise bad_request(problem)
+
     party_name = payload.get("party_name") or customer.get("legal_name")
     party_tax_id = payload.get("party_tax_id") or customer.get("document_number")
     party_address = payload.get("delivery_address") or payload.get("party_address") or customer.get("fiscal_address")
@@ -248,9 +378,17 @@ def create_sale_order(payload: dict[str, Any], actor: AuthUser, meta: RequestMet
         "note": origin,
     }
     # Datos de entrega elegidos en el modal de venta (transportista, fecha y dirección de entrega).
+    # `lim`: fecha límite de pago de una venta al contado; si pasa sin aprobarse, la orden se anula sola.
     creation_form = {
         k: str(v)
-        for k, v in (("tra", payload.get("carrier")), ("ent", payload.get("delivery_date")), ("dir", payload.get("delivery_address")))
+        for k, v in (
+            ("lim", payload.get("pay_deadline")),
+            ("tra", payload.get("carrier")),
+            ("con", payload.get("driver")),
+            ("pla", payload.get("vehicle_plate")),
+            ("ent", payload.get("delivery_date")),
+            ("dir", payload.get("delivery_address")),
+        )
         if v
     }
     # form_data si la columna existe en la BD del usuario
@@ -286,6 +424,10 @@ def complete_step(
     step = int(order.get("current_step") or 1)
     if step >= MAX_STEP:
         raise bad_request("La orden ya completó todos los pasos")
+
+    if step <= 1 and is_past_deadline(_pay_deadlines([order["id"]]).get(order["id"])):
+        expire_unpaid_orders()
+        raise bad_request("La orden venció por falta de pago y fue anulada. Crea una nueva orden")
 
     values = payload.get("values") or {}
     # Normalizar a strings para el frontend

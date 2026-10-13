@@ -32,7 +32,12 @@ class SaleOrderCreate(ApiModel):
     origin: str | None = None  # cotización u origen legible
     # Datos de entrega elegidos en el modal de venta: se guardan en el evento del paso 0 y precargan confirmación/despacho
     carrier: str | None = Field(default=None, max_length=120)
+    # Conductor y vehículo de la flota propia elegidos en el modal; precargan el despacho.
+    driver: str | None = Field(default=None, max_length=160)
+    vehicle_plate: str | None = Field(default=None, max_length=20)
     delivery_date: str | None = Field(default=None, max_length=10)
+    # Venta al contado: fecha límite de pago (yyyy-mm-dd); vencida y sin aprobar, la orden se anula sola.
+    pay_deadline: str | None = Field(default=None, max_length=10)
     delivery_address: str | None = Field(default=None, max_length=300)
 
 
