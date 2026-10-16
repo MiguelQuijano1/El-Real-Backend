@@ -126,12 +126,12 @@ def void_with_credit_note(invoice_id: str, reason: str, actor: AuthUser, meta: R
 
     settings = first(db().table("company_settings").select("credit_note_series").eq("id", 1)) or {}
     series = settings.get("credit_note_series") or "FC01"
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
     y = datetime.now(timezone.utc).year
     n = execute(db().rpc("next_sequence", {"p_type": "NC", "p_year": y, "p_series": series})).data
     n = n[0] if isinstance(n, list) else n
     number = f"{int(n):05d}"
-    today = datetime.now(timezone.utc).date().isoformat()
+    today = datetime.now(timezone(timedelta(hours=-5))).date().isoformat()
     total = -abs(float(inv["total"]))
     subtotal = -abs(float(inv["subtotal"]))
     tax = -abs(float(inv["taxAmount"]))

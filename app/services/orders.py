@@ -590,7 +590,7 @@ def _create_sales_invoice(order: dict[str, Any], values: dict[str, str], actor: 
         doc_type = "RECEIPT"
         series = chosen_series or settings.get("receipt_series") or "B001"
     number = values.get("num") or str(int(datetime.now(timezone.utc).timestamp()) % 100000).zfill(5)
-    issued = values.get("fe") or datetime.now(timezone.utc).date().isoformat()
+    issued = values.get("fe") or datetime.now(timezone(timedelta(hours=-5))).date().isoformat()
     due = values.get("fv") or issued
 
     row = {

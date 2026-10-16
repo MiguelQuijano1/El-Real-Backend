@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from app.core.errors import bad_request, not_found
 from app.repositories.client import db, execute, first, rows
 from app.security.deps import AuthUser
 from app.services.audit import RequestMeta, record
+
+# Perú (UTC−5): «hoy» se calcula en hora de Lima, no en la del servidor (UTC), para no marcar atrasos falsos de noche.
+_LIMA = timezone(timedelta(hours=-5))
 
 MODULE_AR = "receivables"
 MODULE_AP = "payables"
@@ -39,7 +42,7 @@ def _due_status(due: date | None, saldo: float) -> tuple[str, str]:
         return "Cobrada" if True else "Pagada", "cancelada"
     if not due:
         return "Por vencer", "sin fecha"
-    today = date.today()
+    today = datetime.now(_LIMA).date()
     delta = (due - today).days
     if delta < 0:
         return "Vencida", f"{abs(delta)} días de atraso"
@@ -99,6 +102,7 @@ def list_receivables(*, q: str | None = None, limit: int = 100, offset: int = 0)
             "estado": estado,
             "dias": dias,
             "orden": order.get("code") or "",
+            "_created": str(inv.get("created_at") or inv.get("issued_at") or ""),
         }
         if q:
             term = q.strip().lower()
@@ -106,7 +110,8 @@ def list_receivables(*, q: str | None = None, limit: int = 100, offset: int = 0)
                 continue
         items.append(row)
 
-    items.sort(key=lambda r: (0 if r["estado"] == "Vencida" else 1 if r["estado"] == "Vence esta semana" else 2, r["vence"]))
+    # Lo último emitido primero.
+    items.sort(key=lambda r: (r["emision"], r.pop("_created")), reverse=True)
     total_n = len(items)
     return {"items": items[offset : offset + limit], "total": total_n, "limit": limit, "offset": offset}
 
@@ -226,6 +231,7 @@ def list_payables(*, q: str | None = None, limit: int = 100, offset: int = 0) ->
             "estado": estado if estado != "Cobrada" else "Pagada",
             "dias": dias,
             "orden": order.get("code") or "",
+            "_created": str(inv.get("created_at") or inv.get("issued_at") or ""),
         }
         if q:
             term = q.strip().lower()
@@ -233,7 +239,8 @@ def list_payables(*, q: str | None = None, limit: int = 100, offset: int = 0) ->
                 continue
         items.append(row)
 
-    items.sort(key=lambda r: (0 if r["estado"] == "Vencida" else 1 if r["estado"] == "Vence esta semana" else 2, r["vence"]))
+    # Lo último emitido primero.
+    items.sort(key=lambda r: (r["emision"], r.pop("_created")), reverse=True)
     total_n = len(items)
     return {"items": items[offset : offset + limit], "total": total_n, "limit": limit, "offset": offset}
 
