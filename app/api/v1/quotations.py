@@ -67,9 +67,9 @@ def convert_(
     actor: AuthUser = Depends(_create),
 ):
     # Convertir requiere crear orden de venta
-    return svc.convert_quotation(
-        quotation_id, actor, request_meta(request), customer_id=payload.customer_id if payload else None
-    )
+    extra = payload.model_dump(exclude_none=True, mode="json") if payload else {}
+    customer_id = extra.pop("customer_id", None)
+    return svc.convert_quotation(quotation_id, actor, request_meta(request), customer_id=customer_id, overrides=extra)
 
 
 @router.delete("/{quotation_id}", status_code=204)

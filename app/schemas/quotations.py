@@ -32,6 +32,17 @@ class QuotationUpdate(ApiModel):
 
 class QuotationConvertIn(ApiModel):
     customer_id: str | None = None
+    # Datos que se completan en el modal de la orden de venta al convertir (todos opcionales).
+    warehouse_id: str | None = None
+    seller_user_id: str | None = None
+    payment_terms_days: int | None = Field(default=None, ge=0, le=365)
+    carrier: str | None = None
+    driver: str | None = None
+    vehicle_plate: str | None = None
+    delivery_date: date | None = None
+    delivery_address: str | None = None
+    pay_deadline: date | None = None
+    lines: list[OrderLineIn] | None = None
 
 
 class QuotationStatusIn(ApiModel):

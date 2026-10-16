@@ -330,7 +330,11 @@ def delete_quotation(id_or_code: str, actor: AuthUser, meta: RequestMeta) -> Non
 
 
 def convert_quotation(
-    id_or_code: str, actor: AuthUser, meta: RequestMeta, customer_id: str | None = None
+    id_or_code: str,
+    actor: AuthUser,
+    meta: RequestMeta,
+    customer_id: str | None = None,
+    overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Convierte una cotización APROBADA en orden de venta.
 
@@ -386,6 +390,22 @@ def convert_quotation(
         "origin": q["code"],
         "lines": lines,
     }
+    # Lo que el usuario completó en el modal de la orden (entrega, transporte, pago, ajustes de líneas).
+    for k, v in (overrides or {}).items():
+        if k == "lines":
+            order_payload["lines"] = [
+                {
+                    "product_id": ln.get("product_id"),
+                    "sku": ln.get("sku"),
+                    "name": ln.get("name"),
+                    "unit": ln.get("unit"),
+                    "quantity": ln.get("quantity"),
+                    "unit_price": ln.get("unit_price"),
+                }
+                for ln in v
+            ]
+        elif v not in (None, ""):
+            order_payload[k] = v
     if not order_payload["warehouse_id"]:
         wh = first(db().table("warehouses").select("id").eq("status", "ACTIVE"))
         if not wh:
