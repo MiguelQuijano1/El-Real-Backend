@@ -8,6 +8,8 @@ from app.schemas import masters as m
 from app.security.deps import AuthUser, request_meta, require_permission
 from app.services import masters as svc
 from app.services.masters import MasterConfig
+from app.schemas.master_import import ImportIn
+from app.services import master_import
 
 # NOTA: este archivo no usa `from __future__ import annotations` a propósito: FastAPI necesita
 # resolver las anotaciones de los modelos creados dentro de la fábrica.
@@ -31,6 +33,14 @@ def build_master_router(cfg: MasterConfig, create_model: type, update_model: typ
     ):
         extra = {k: v for k, v in request.query_params.items() if k in cfg.filters}
         return svc.list_records(cfg, q=q, status=status, extra=extra, limit=limit, offset=offset)
+
+    # Va antes de "/{record_id}" para que «import» no se tome como un id.
+    @router.post("/import", summary=f"Importar {cfg.module} desde un archivo")
+    def import_(request: Request, payload: ImportIn = Body(...),
+                actor: AuthUser = Depends(create), _can_edit: AuthUser = Depends(edit)):
+        # Crear y editar: una importación da de alta registros nuevos y actualiza los que ya existen.
+        return master_import.import_rows(cfg, create_model, payload.rows, dry_run=payload.dry_run,
+                                         fields=payload.fields, actor=actor, meta=request_meta(request))
 
     @router.get("/{record_id}", summary=f"Obtener {cfg.module}")
     def get_(record_id: str, _: AuthUser = Depends(view)):
@@ -63,29 +73,29 @@ def _uuid(value: str) -> str:
 MASTERS: list[tuple[str, MasterConfig, type, tuple[str, ...]]] = [
     ("customers", MasterConfig("customers", "customers", "Customer", "Cliente", "legal_name",
                                ("legal_name", "document_number", "code", "contact_name"), "CLI",
-                               filters=("salesperson_user_id", "document_type")), m.CustomerIn, ()),
+                               filters=("salesperson_user_id", "document_type"), import_key=("document_type", "document_number")), m.CustomerIn, ()),
     ("suppliers", MasterConfig("suppliers", "suppliers", "Supplier", "Proveedor", "legal_name",
                                ("legal_name", "tax_id", "code", "contact_name"), "PRV",
-                               filters=("business_category",)), m.SupplierIn, ()),
+                               filters=("business_category",), import_key=("tax_id",)), m.SupplierIn, ()),
     ("products", MasterConfig("products", "products", "Product", "Producto", "sku",
                               ("name", "sku"), None,
-                              filters=("category_id", "primary_supplier_id")), m.ProductIn, ()),
+                              filters=("category_id", "primary_supplier_id"), import_key=("sku",)), m.ProductIn, ()),
     ("categories", MasterConfig("product_categories", "categories", "ProductCategory", "Categoría", "name",
                                 ("name", "code"), "CAT", has_created_at=False,
-                                filters=("parent_category_id",)), m.CategoryIn, ()),
+                                filters=("parent_category_id",), import_key=("name",)), m.CategoryIn, ()),
     ("warehouses", MasterConfig("warehouses", "warehouses", "Warehouse", "Almacén", "name",
                                 ("name", "code", "district"), "ALM", has_created_at=False,
-                                filters=("warehouse_type",)), m.WarehouseIn, ()),
+                                filters=("warehouse_type",), import_key=("name",)), m.WarehouseIn, ()),
     ("drivers", MasterConfig("drivers", "drivers", "Driver", "Conductor", "full_name",
                              ("full_name", "national_id", "license_number", "code"), "CON",
-                             filters=("carrier_supplier_id",)), m.DriverIn, ()),
+                             filters=("carrier_supplier_id",), import_key=("national_id",)), m.DriverIn, ()),
     ("vehicles", MasterConfig("vehicles", "vehicles", "Vehicle", "Vehículo", "plate",
                               ("plate", "brand", "model"), None,
-                              filters=("carrier_supplier_id",)), m.VehicleIn, ()),
+                              filters=("carrier_supplier_id",), import_key=("plate",)), m.VehicleIn, ()),
     # Lista de precios por proveedor. Usa los permisos de Proveedores.
     ("supplier-products", MasterConfig("supplier_products", "suppliers", "SupplierProduct", "Precio de proveedor", "supplier_id",
                                      ("supplier_sku", "notes"), None,
-                                     filters=("supplier_id", "product_id")), m.SupplierProductIn, ()),
+                                     filters=("supplier_id", "product_id"), import_key=("supplier_id", "product_id")), m.SupplierProductIn, ()),
 ]
 
 

@@ -22,6 +22,8 @@ class MasterConfig:
     default_order: str = "created_at"
     has_created_at: bool = True
     filters: tuple[str, ...] = ()    # campos filtrables por igualdad en el listado (?category_id=…)
+    # Columnas que identifican un registro al importar: si ya existe, se actualiza en vez de duplicarse.
+    import_key: tuple[str, ...] = ()
 
 
 _UNSAFE_SEARCH = re.compile(r"[,()*%\\:]")
