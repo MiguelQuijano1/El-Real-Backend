@@ -325,6 +325,8 @@ def create_sale_order(payload: dict[str, Any], actor: AuthUser, meta: RequestMet
 
     party_name = payload.get("party_name") or customer.get("legal_name")
     party_tax_id = payload.get("party_tax_id") or customer.get("document_number")
+    if payload.get("document_type") == "Factura" and len("".join(c for c in str(party_tax_id or "") if c.isdigit())) != 11:
+        raise bad_request("Solo se puede emitir factura a un cliente con RUC; usa boleta.")
     party_address = payload.get("delivery_address") or payload.get("party_address") or customer.get("fiscal_address")
     party_contact = payload.get("party_contact") or customer.get("contact_name")
     party_email = payload.get("party_email") or customer.get("billing_email")
@@ -388,6 +390,8 @@ def create_sale_order(payload: dict[str, Any], actor: AuthUser, meta: RequestMet
             ("pla", payload.get("vehicle_plate")),
             ("ent", payload.get("delivery_date")),
             ("dir", payload.get("delivery_address")),
+            # `tdc`: comprobante elegido al crear (Factura/Boleta); precarga el paso de facturación.
+            ("tdc", payload.get("document_type")),
         )
         if v
     }

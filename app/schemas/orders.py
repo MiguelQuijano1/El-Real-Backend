@@ -1,6 +1,6 @@
 from datetime import date
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field
 
@@ -39,6 +39,8 @@ class SaleOrderCreate(ApiModel):
     # Venta al contado: fecha límite de pago (yyyy-mm-dd); vencida y sin aprobar, la orden se anula sola.
     pay_deadline: str | None = Field(default=None, max_length=10)
     delivery_address: str | None = Field(default=None, max_length=300)
+    # Comprobante que se emitirá al facturar (sales_document_type: INVOICE / RECEIPT). Factura exige RUC.
+    document_type: Literal["Factura", "Boleta"] | None = None
 
 
 class CompleteStepIn(ApiModel):
