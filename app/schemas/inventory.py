@@ -1,3 +1,4 @@
+from typing import Any
 from decimal import Decimal
 
 from pydantic import Field
@@ -26,3 +27,8 @@ class AdjustmentCreate(ApiModel):
     adjustment_type: str = Field(pattern="^(LOSS|SURPLUS|EXPIRY|CORRECTION|Merma|Sobrante|Vencimiento|Corrección)$")
     quantity: Decimal = Field(gt=0)
     reason: str = Field(min_length=1)
+
+class OpeningStockIn(ApiModel):
+    """Stock inicial desde el importador: filas {sku, warehouse, quantity, unitCost}."""
+    rows: list[dict[str, Any]] = Field(min_length=1, max_length=2000)
+    dry_run: bool = True

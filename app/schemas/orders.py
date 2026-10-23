@@ -41,6 +41,9 @@ class SaleOrderCreate(ApiModel):
     delivery_address: str | None = Field(default=None, max_length=300)
     # Comprobante que se emitirá al facturar (sales_document_type: INVOICE / RECEIPT). Factura exige RUC.
     document_type: Literal["Factura", "Boleta"] | None = None
+    # Descuento global (S/, sin IGV) ya repartido en el precio de cada línea; se guarda para mostrarlo y se valida
+    # contra el descuento máximo de Configuración (company_settings.max_discount_pct).
+    discount_amount: Decimal = Field(default=Decimal("0"), ge=0)
 
 
 class CompleteStepIn(ApiModel):

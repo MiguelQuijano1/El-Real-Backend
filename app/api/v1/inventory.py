@@ -5,6 +5,7 @@ from fastapi import APIRouter, Body, Depends, Query, Request
 from app.schemas import inventory as sch
 from app.security.deps import AuthUser, request_meta, require_permission
 from app.services import inventory as svc
+from app.services import opening_stock as opening_stock_svc
 
 router = APIRouter(tags=["inventory"])
 
@@ -96,6 +97,15 @@ def adjustments_list(
     _: AuthUser = Depends(require_permission("adjustments", "view")),
 ):
     return svc.list_adjustments(q=q, limit=limit, offset=offset)
+
+
+@router.post("/opening-stock", summary="Stock inicial desde el importador (simulación o guardado)")
+def opening_stock(
+    request: Request,
+    payload: sch.OpeningStockIn = Body(...),
+    actor: AuthUser = Depends(require_permission("adjustments", "create")),
+):
+    return opening_stock_svc.import_opening_stock(payload.rows, dry_run=payload.dry_run, actor=actor, meta=request_meta(request))
 
 
 @router.post("/adjustments", status_code=201)

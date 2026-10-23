@@ -293,6 +293,17 @@ def get_sale_order(order_id_or_code: str) -> dict[str, Any]:
     return _serialize(row, seller_name)
 
 
+def discount_error(net_subtotal: float, discount: float, max_pct: float) -> str | None:
+    """El descuento global (sobre el subtotal antes del descuento) no puede pasar el máximo de Configuración."""
+    gross = net_subtotal + discount
+    if net_subtotal <= 0:
+        return "El descuento no puede ser igual o mayor que el subtotal de la orden"
+    pct = discount / gross * 100
+    if pct > max_pct + 0.01:
+        return f"El descuento ({pct:.1f}%) supera el máximo permitido en Configuración ({max_pct:g}%)"
+    return None
+
+
 def create_sale_order(payload: dict[str, Any], actor: AuthUser, meta: RequestMeta) -> dict[str, Any]:
     customer_id = payload["customer_id"]
     warehouse_id = payload["warehouse_id"]
@@ -325,6 +336,13 @@ def create_sale_order(payload: dict[str, Any], actor: AuthUser, meta: RequestMet
 
     party_name = payload.get("party_name") or customer.get("legal_name")
     party_tax_id = payload.get("party_tax_id") or customer.get("document_number")
+    discount = float(payload.get("discount_amount") or 0)
+    if discount > 0:
+        net = sum(float(ln["quantity"]) * float(ln["unit_price"]) for ln in lines_in)
+        settings_row = first(db().table("company_settings").select("max_discount_pct").eq("id", 1)) or {}
+        err = discount_error(net, discount, float(settings_row.get("max_discount_pct") or 0))
+        if err:
+            raise bad_request(err)
     if payload.get("document_type") == "Factura" and len("".join(c for c in str(party_tax_id or "") if c.isdigit())) != 11:
         raise bad_request("Solo se puede emitir factura a un cliente con RUC; usa boleta.")
     party_address = payload.get("delivery_address") or payload.get("party_address") or customer.get("fiscal_address")
@@ -392,6 +410,8 @@ def create_sale_order(payload: dict[str, Any], actor: AuthUser, meta: RequestMet
             ("dir", payload.get("delivery_address")),
             # `tdc`: comprobante elegido al crear (Factura/Boleta); precarga el paso de facturación.
             ("tdc", payload.get("document_type")),
+            # `dsc`: descuento global en soles (ya repartido en los precios de las líneas).
+            ("dsc", f"{float(payload.get('discount_amount') or 0):.2f}" if float(payload.get("discount_amount") or 0) > 0 else None),
         )
         if v
     }
