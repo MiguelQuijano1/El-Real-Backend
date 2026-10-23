@@ -44,6 +44,9 @@ class SaleOrderCreate(ApiModel):
     # Descuento global (S/, sin IGV) ya repartido en el precio de cada línea; se guarda para mostrarlo y se valida
     # contra el descuento máximo de Configuración (company_settings.max_discount_pct).
     discount_amount: Decimal = Field(default=Decimal("0"), ge=0)
+    # "pct": se escribió en % y no puede pasar el máximo de Configuración; "amount": monto libre en soles
+    # (solo debe ser menor que el subtotal), porque se reparte entre los productos.
+    discount_mode: Literal["pct", "amount"] = "pct"
 
 
 class CompleteStepIn(ApiModel):
