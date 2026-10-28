@@ -26,6 +26,7 @@ pip install -r requirements-dev.txt
 | `database/001_schema.sql` | 34 tablas, enums, índices, triggers de `updated_at` y RLS (idéntico al `schema.prisma` anterior) |
 | `database/002_functions.sql` | `register_failed_login` y `next_sequence` (atómicas) y sus permisos |
 | `database/003_storage.sql` | Bucket **privado** `documents` |
+| `database/010_modulos_gestion.sql` | Tablas de los módulos de Gestión (metas, comisiones, inventario físico, entregas, flujo de caja, interruptores). Ejecutar después de los scripts `004`–`009` |
 
 **2. Configurar `.env`** (ya incluido, solo faltan tus credenciales):
 
@@ -78,6 +79,12 @@ curl -X POST http://localhost:8000/api/v1/auth/login \
 | `GET/PATCH /settings` | `settings` |
 | `GET/POST /customers` · `/suppliers` · `/products` · `/categories` · `/warehouses` · `/drivers` · `/vehicles` y `GET/PATCH/DELETE /{id}` | un módulo por recurso |
 | `GET/POST /documents` · `GET /documents/{id}/download-url` · `DELETE /documents/{id}` | `documents` |
+| `GET /module-switches` · `PUT /module-switches/{id}` | sesión · `settings:edit` |
+| `GET/POST /sales-goals` · `POST /sales-goals/copy` · `PATCH/DELETE /sales-goals/{id}` | `reports:view` · `settings:edit` |
+| `GET /commissions` · `PUT /commissions/default-pct` · `PUT /commissions/seller-pct` · `POST /commissions/payouts` | `reports:view` · `settings:edit` |
+| `GET/POST /stock-counts` · `GET /stock-counts/{id}` · `PATCH /stock-counts/{id}/items/{itemId}` · `POST /stock-counts/{id}/close` | `adjustments:view` · `adjustments:create` |
+| `GET /deliveries?codes=` · `PUT/DELETE /deliveries/{orderCode}` | `sales-orders:view` · `sales-orders:edit` |
+| `GET/PUT /cashflow/settings` | `receivables:view` · `cash:edit` |
 | `GET /health` | público |
 
 Listados: `?q=` (búsqueda), `?status=ACTIVE|INACTIVE`, `?limit=` (máx. 200), `?offset=` → `{ items, total, limit, offset }`.
