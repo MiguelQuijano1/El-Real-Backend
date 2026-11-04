@@ -11,6 +11,7 @@ from app.repositories.client import db, execute, find_by_id_or_code, first, rows
 from app.schemas import gestion as sch
 from app.security.deps import AuthUser
 from app.services import inventory as inventory_svc
+from app.services import notifications as notif_svc
 from app.services.audit import RequestMeta, record
 
 MODULE_IDS = ("reposicion", "flujoCaja", "metas", "comisiones", "conteo", "entregas")
@@ -294,7 +295,11 @@ def list_deliveries(codes: list[str]) -> list[dict[str, Any]]:
 
 
 def _dispatched_order(code: str) -> dict[str, Any]:
-    order = find_by_id_or_code("business_orders", code, "id, code, is_cancelled, current_step", kind="SALE")
+    order = find_by_id_or_code(
+        "business_orders", code,
+        "id, code, is_cancelled, current_step, party_name, party_email, party_address",
+        kind="SALE",
+    )
     if not order:
         raise not_found("Sales order not found")
     if order["is_cancelled"] or int(order["current_step"] or 1) < 3:
@@ -321,6 +326,31 @@ def upsert_delivery(code: str, dto: sch.DeliveryIn, actor: AuthUser, meta: Reque
     label = "entregada" if dto.status == "DELIVERED" else "no entregada"
     record(actor.actor, action="EDIT", module_key="sales-orders", entity_type="DeliveryConfirmation", entity_id=order["id"],
            reference=order["code"], description=f"Entrega de {order['code']} marcada como {label}", meta=meta)
+
+    # Email de seguimiento al cliente (best-effort, no bloquea)
+    import asyncio
+    order_snap = {
+        "id": order["id"],
+        "code": order["code"],
+        "party_name": order.get("party_name"),
+        "party_email": order.get("party_email"),
+        "party_address": order.get("party_address"),
+    }
+    extra: dict[str, Any] = {}
+    if dto.status == "DELIVERED":
+        event = "delivered"
+        extra = {"receiver": dto.receiver or ""}
+    else:
+        event = "not_delivered"
+        extra = {"reason": dto.reason or "", "note": dto.note or ""}
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(notif_svc.send_delivery_email(order_snap, event, extra))
+    except RuntimeError:
+        pass
+
     return _delivery_view(order["code"], saved)
 
 
