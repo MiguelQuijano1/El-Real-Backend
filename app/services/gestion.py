@@ -363,6 +363,117 @@ def delete_delivery(code: str, actor: AuthUser, meta: RequestMeta) -> None:
            reference=order["code"], description=f"Entrega de {order['code']} vuelta a pendiente", meta=meta)
 
 
+# ═════════════════════════════ Mapa de entregas ═════════════════════════════
+
+def _delivery_status(confirmation: dict[str, Any] | None) -> str:
+    if not confirmation:
+        return "Pendiente"
+    return "Entregado" if confirmation["status"] == "DELIVERED" else "No entregado"
+
+
+def get_map(day: str) -> dict[str, Any]:
+    """Stops del día con lat/lng + almacenes. day = 'YYYY-MM-DD'."""
+    orders = rows(
+        db().table("business_orders")
+        .select("id, code, party_name, party_address, delivery_lat, delivery_lng, "
+                "delivery_date, vehicle_plate, driver_name, warehouse_id")
+        .eq("kind", "SALE")
+        .eq("is_cancelled", False)
+        .gte("current_step", 3)
+        .eq("delivery_date", day)
+    )
+    order_ids = [o["id"] for o in orders]
+
+    confirmations: dict[str, dict[str, Any]] = {}
+    for i in range(0, len(order_ids), CHUNK):
+        for c in rows(db().table("delivery_confirmations").select("*").in_("order_id", order_ids[i:i + CHUNK])):
+            confirmations[c["order_id"]] = c
+
+    plates = list({o.get("vehicle_plate") or "" for o in orders if o.get("vehicle_plate")})
+    vehicle_zones: dict[str, list[str]] = {}
+    if plates:
+        for v in rows(db().table("vehicles").select("plate, zones").in_("plate", plates)):
+            vehicle_zones[v["plate"]] = v.get("zones") or []
+
+    stops = []
+    for seq, o in enumerate(orders, 1):
+        plate = o.get("vehicle_plate") or "Sin vehículo"
+        stops.append({
+            "code": o["code"],
+            "client": o.get("party_name") or "",
+            "address": o.get("party_address") or "",
+            "lat": o.get("delivery_lat"),
+            "lng": o.get("delivery_lng"),
+            "vehicle": plate,
+            "driver": o.get("driver_name") or "",
+            "status": _delivery_status(confirmations.get(o["id"])),
+            "seq": seq,
+            "zones": vehicle_zones.get(plate, []),
+        })
+
+    warehouses_raw = rows(db().table("warehouses").select("name, address, lat, lng").eq("status", "ACTIVE"))
+    warehouses = [{"name": w["name"], "address": w.get("address"), "lat": w.get("lat"), "lng": w.get("lng")} for w in warehouses_raw]
+
+    return {"stops": stops, "warehouses": warehouses}
+
+
+def get_route(plate: str, day: str) -> dict[str, Any]:
+    """Stops del vehículo indicado en el día indicado (para la vista del repartidor)."""
+    result = get_map(day)
+    vehicle_stops = [s for s in result["stops"] if s["vehicle"] == plate]
+    vehicle_info = first(db().table("vehicles").select("plate, zones").eq("plate", plate))
+    driver_name = vehicle_stops[0]["driver"] if vehicle_stops else ""
+    return {
+        "vehicle": plate,
+        "driver": driver_name,
+        "zones": (vehicle_info or {}).get("zones") or [],
+        "stops": vehicle_stops,
+    }
+
+
+# ═════════════════════════════ Configuración SMTP ═════════════════════════════
+
+def get_smtp_settings() -> dict[str, Any]:
+    row = first(db().table("smtp_settings").select("host, port, username, from_address, use_tls, enabled").eq("id", 1))
+    if not row:
+        return {"host": "", "port": 587, "username": "", "from_address": "", "use_tls": True, "enabled": False}
+    return row
+
+
+def save_smtp_settings(dto: "sch.SmtpSettingsIn") -> dict[str, Any]:
+    patch: dict[str, Any] = {
+        "host": dto.host, "port": dto.port, "username": dto.username,
+        "from_address": dto.from_address, "use_tls": dto.use_tls,
+        "enabled": dto.enabled, "updated_at": _now(),
+    }
+    if dto.password is not None:
+        patch["password"] = dto.password
+    execute(db().table("smtp_settings").update(patch).eq("id", 1))
+    return get_smtp_settings()
+
+
+async def test_smtp_settings() -> dict[str, Any]:
+    """Envía un email de prueba con la configuración guardada en BD."""
+    cfg = get_smtp_settings()
+    if not cfg.get("host"):
+        return {"ok": False, "error": "No hay host SMTP configurado"}
+    import aiosmtplib
+    from email.mime.text import MIMEText
+    msg = MIMEText("Correo de prueba desde EnterpriseCloud ERP.", "plain", "utf-8")
+    msg["Subject"] = "Prueba de correo — EnterpriseCloud"
+    msg["From"] = cfg.get("from_address") or cfg["host"]
+    msg["To"] = cfg.get("username") or cfg["host"]
+    try:
+        await aiosmtplib.send(
+            msg, hostname=cfg["host"], port=int(cfg.get("port", 587)),
+            username=cfg.get("username", ""), password=cfg.get("password", ""),
+            start_tls=bool(cfg.get("use_tls", True)),
+        )
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 # ═════════════════════════════ Flujo de caja ═════════════════════════════
 def get_cashflow() -> dict[str, Any]:
     row = first(db().table("cashflow_settings").select("opening_balance").eq("id", 1))
