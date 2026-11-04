@@ -9,6 +9,8 @@ from app.repositories.client import db, execute, find_by_id_or_code, first, rows
 from app.services.costing import get_average_cost
 from app.security.deps import AuthUser
 from app.services.audit import Actor, RequestMeta, record
+from app.services import geocoding as geo_svc
+from app.services import notifications as notif_svc
 
 MODULE = "sales-orders"
 KIND_SALE = "SALE"
@@ -516,6 +518,25 @@ def complete_step(
         meta=meta,
         changes=[("current_step", str(step), str(step + 1))],
     )
+
+    # Disparar geocodificación y email de despacho de forma asíncrona (best-effort)
+    if step == 2 and order.get("kind") == KIND_SALE:
+        import asyncio
+        order_snap = {
+            "id": order["id"],
+            "code": order["code"],
+            "party_name": order.get("party_name"),
+            "party_email": order.get("party_email"),
+            "party_address": order.get("party_address"),
+        }
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(geo_svc.geocode_order(order["id"]))
+                asyncio.ensure_future(notif_svc.send_delivery_email(order_snap, "dispatched"))
+        except RuntimeError:
+            pass  # entorno sync (tests): no disparar
+
     return get_sale_order(order["id"])
 
 
