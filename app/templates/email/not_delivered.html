@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Intento de entrega</title>
+<style>
+  body { font-family: Arial, sans-serif; background: #f5f5f5; margin: 0; padding: 20px; }
+  .card { background: #fff; border-radius: 8px; max-width: 520px; margin: 0 auto; padding: 32px; }
+  .badge { display: inline-block; background: #dc2626; color: #fff; border-radius: 4px; padding: 4px 12px; font-size: 13px; font-weight: 600; margin-bottom: 20px; }
+  h1 { font-size: 20px; margin: 0 0 12px; color: #111; }
+  p { color: #444; line-height: 1.6; margin: 0 0 12px; }
+  .code { font-family: monospace; background: #f0f0f0; padding: 2px 6px; border-radius: 3px; }
+  .footer { margin-top: 24px; font-size: 12px; color: #888; border-top: 1px solid #eee; padding-top: 16px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="badge">! No entregado</div>
+  <h1>No pudimos entregar tu pedido</h1>
+  <p>Hola {{ client_name }},</p>
+  <p>Intentamos entregar tu pedido <span class="code">{{ order_code }}</span> pero no fue posible.</p>
+  <p><strong>Motivo:</strong> {{ reason }}</p>
+  {% if note %}
+  <p><strong>Observación:</strong> {{ note }}</p>
+  {% endif %}
+  <p>Nos pondremos en contacto contigo para reprogramar la entrega.</p>
+  <div class="footer">{{ company_name }} · Este correo fue generado automáticamente.</div>
+</div>
+</body>
+</html>
