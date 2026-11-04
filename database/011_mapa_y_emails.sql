@@ -6,11 +6,6 @@ begin;
 
 -- ── Coordenadas para geocodificación ──────────────────────────────────────────
 
--- Clientes: lat/lng cacheadas (Nominatim)
-alter table customers
-    add column if not exists lat double precision,
-    add column if not exists lng double precision;
-
 -- Almacenes: lat/lng (address y district ya existen)
 alter table warehouses
     add column if not exists lat double precision,
@@ -20,7 +15,7 @@ alter table warehouses
 alter table vehicles
     add column if not exists zones text[] not null default '{}';
 
--- Órdenes: coordenadas de la dirección de entrega (cacheadas al despachar)
+-- Órdenes: coordenadas de la dirección de entrega (cacheadas al geocodificar)
 alter table business_orders
     add column if not exists delivery_lat double precision,
     add column if not exists delivery_lng double precision;

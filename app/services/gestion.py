@@ -371,33 +371,95 @@ def _delivery_status(confirmation: dict[str, Any] | None) -> str:
     return "Entregado" if confirmation["status"] == "DELIVERED" else "No entregado"
 
 
+def _get_warehouses() -> list[dict[str, Any]]:
+    whs = rows(db().table("warehouses").select("name, address, lat, lng").eq("status", "ACTIVE"))
+    return [{"name": w["name"], "address": w.get("address"), "lat": w.get("lat"), "lng": w.get("lng")} for w in whs]
+
+
+def _dispatch_form_data(order_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Devuelve {order_id: form_data} del step de despacho (step_no=2) para las órdenes indicadas."""
+    out: dict[str, dict[str, Any]] = {}
+    for i in range(0, len(order_ids), CHUNK):
+        for ev in rows(
+            db().table("order_step_events")
+            .select("order_id, form_data")
+            .in_("order_id", order_ids[i:i + CHUNK])
+            .eq("step_no", 2)
+        ):
+            out[ev["order_id"]] = ev.get("form_data") or {}
+    return out
+
+
 def get_map(day: str) -> dict[str, Any]:
-    """Stops del día con lat/lng + almacenes. day = 'YYYY-MM-DD'."""
-    orders = rows(
+    """Stops del día con lat/lng + almacenes. day = 'YYYY-MM-DD'.
+
+    La fecha de entrega (ent) se guarda en form_data del paso de despacho (step_no=2).
+    El vehículo (pla) y conductor (con) también vienen de ese form_data.
+    """
+    # 1. Obtener todos los pedidos despachados (current_step >= 3, no anulados)
+    all_orders = _all(lambda: (
         db().table("business_orders")
-        .select("id, code, party_name, party_address, delivery_lat, delivery_lng, "
-                "delivery_date, vehicle_plate, driver_name, warehouse_id")
+        .select("id, code, party_name, party_address, delivery_lat, delivery_lng")
         .eq("kind", "SALE")
         .eq("is_cancelled", False)
         .gte("current_step", 3)
-        .eq("delivery_date", day)
-    )
+    ))
+    if not all_orders:
+        return {"stops": [], "warehouses": _get_warehouses()}
+
+    all_ids = [o["id"] for o in all_orders]
+
+    # 2. Leer form_data del paso de despacho para filtrar por fecha de entrega (ent)
+    dispatch_fd = _dispatch_form_data(all_ids)
+
+    # 3. Filtrar por día — 'ent' en step 2; algunos pedidos lo guardan en step 1
+    step1_fd: dict[str, dict[str, Any]] = {}
+    orders_no_step2 = [oid for oid in all_ids if oid not in dispatch_fd]
+    if orders_no_step2:
+        for i in range(0, len(orders_no_step2), CHUNK):
+            for ev in rows(
+                db().table("order_step_events")
+                .select("order_id, form_data")
+                .in_("order_id", orders_no_step2[i:i + CHUNK])
+                .eq("step_no", 1)
+            ):
+                step1_fd[ev["order_id"]] = ev.get("form_data") or {}
+
+    orders_today_ids: set[str] = set()
+    for o in all_orders:
+        oid = o["id"]
+        fd2 = dispatch_fd.get(oid) or {}
+        fd1 = step1_fd.get(oid) or {}
+        ent = fd2.get("ent") or fd1.get("ent") or ""
+        if ent == day:
+            orders_today_ids.add(oid)
+
+    orders = [o for o in all_orders if o["id"] in orders_today_ids]
+    if not orders:
+        return {"stops": [], "warehouses": _get_warehouses()}
+
     order_ids = [o["id"] for o in orders]
 
+    # 4. Confirmaciones de entrega
     confirmations: dict[str, dict[str, Any]] = {}
     for i in range(0, len(order_ids), CHUNK):
         for c in rows(db().table("delivery_confirmations").select("*").in_("order_id", order_ids[i:i + CHUNK])):
             confirmations[c["order_id"]] = c
 
-    plates = list({o.get("vehicle_plate") or "" for o in orders if o.get("vehicle_plate")})
+    # 5. Zonas de vehículos que aparecen hoy
+    plates = list({(dispatch_fd.get(oid) or {}).get("pla") or "" for oid in order_ids
+                   if (dispatch_fd.get(oid) or {}).get("pla")})
     vehicle_zones: dict[str, list[str]] = {}
     if plates:
         for v in rows(db().table("vehicles").select("plate, zones").in_("plate", plates)):
             vehicle_zones[v["plate"]] = v.get("zones") or []
 
+    # 6. Construir stops
     stops = []
     for seq, o in enumerate(orders, 1):
-        plate = o.get("vehicle_plate") or "Sin vehículo"
+        fd = dispatch_fd.get(o["id"]) or step1_fd.get(o["id"]) or {}
+        plate = fd.get("pla") or "Sin vehículo"
+        driver = fd.get("con") or ""
         stops.append({
             "code": o["code"],
             "client": o.get("party_name") or "",
@@ -405,16 +467,13 @@ def get_map(day: str) -> dict[str, Any]:
             "lat": o.get("delivery_lat"),
             "lng": o.get("delivery_lng"),
             "vehicle": plate,
-            "driver": o.get("driver_name") or "",
+            "driver": driver,
             "status": _delivery_status(confirmations.get(o["id"])),
             "seq": seq,
             "zones": vehicle_zones.get(plate, []),
         })
 
-    warehouses_raw = rows(db().table("warehouses").select("name, address, lat, lng").eq("status", "ACTIVE"))
-    warehouses = [{"name": w["name"], "address": w.get("address"), "lat": w.get("lat"), "lng": w.get("lng")} for w in warehouses_raw]
-
-    return {"stops": stops, "warehouses": warehouses}
+    return {"stops": stops, "warehouses": _get_warehouses()}
 
 
 def get_route(plate: str, day: str) -> dict[str, Any]:
