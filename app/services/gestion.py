@@ -12,6 +12,7 @@ from app.schemas import gestion as sch
 from app.security.deps import AuthUser
 from app.services import inventory as inventory_svc
 from app.services import notifications as notif_svc
+from app.services.background import run_in_background
 from app.services.audit import RequestMeta, record
 
 MODULE_IDS = ("reposicion", "flujoCaja", "metas", "comisiones", "conteo", "entregas")
@@ -328,7 +329,6 @@ def upsert_delivery(code: str, dto: sch.DeliveryIn, actor: AuthUser, meta: Reque
            reference=order["code"], description=f"Entrega de {order['code']} marcada como {label}", meta=meta)
 
     # Email de seguimiento al cliente (best-effort, no bloquea)
-    import asyncio
     order_snap = {
         "id": order["id"],
         "code": order["code"],
@@ -344,12 +344,7 @@ def upsert_delivery(code: str, dto: sch.DeliveryIn, actor: AuthUser, meta: Reque
         event = "not_delivered"
         extra = {"reason": dto.reason or "", "note": dto.note or ""}
 
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.ensure_future(notif_svc.send_delivery_email(order_snap, event, extra))
-    except RuntimeError:
-        pass
+    run_in_background(notif_svc.send_delivery_email, order_snap, event, extra)
 
     return _delivery_view(order["code"], saved)
 

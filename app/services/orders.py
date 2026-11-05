@@ -11,6 +11,7 @@ from app.security.deps import AuthUser
 from app.services.audit import Actor, RequestMeta, record
 from app.services import geocoding as geo_svc
 from app.services import notifications as notif_svc
+from app.services.background import run_in_background
 
 MODULE = "sales-orders"
 KIND_SALE = "SALE"
@@ -521,7 +522,6 @@ def complete_step(
 
     # Disparar geocodificación y email de despacho de forma asíncrona (best-effort)
     if step == 2 and order.get("kind") == KIND_SALE:
-        import asyncio
         order_snap = {
             "id": order["id"],
             "code": order["code"],
@@ -529,13 +529,8 @@ def complete_step(
             "party_email": order.get("party_email"),
             "party_address": order.get("party_address"),
         }
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(geo_svc.geocode_order(order["id"]))
-                asyncio.ensure_future(notif_svc.send_delivery_email(order_snap, "dispatched"))
-        except RuntimeError:
-            pass  # entorno sync (tests): no disparar
+        run_in_background(geo_svc.geocode_order, order["id"])
+        run_in_background(notif_svc.send_delivery_email, order_snap, "dispatched")
 
     return get_sale_order(order["id"])
 
