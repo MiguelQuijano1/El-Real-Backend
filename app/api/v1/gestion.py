@@ -133,6 +133,17 @@ def deliveries_put(order_code: str, request: Request, dto: sch.DeliveryIn = Body
     return camel(svc.upsert_delivery(order_code, dto, actor, request_meta(request)))
 
 
+@router.get("/route-departures")
+def route_departures_list(day: str, _: AuthUser = Depends(require_permission("sales-orders", "view"))):
+    return camel({"items": svc.list_route_departures(day)})
+
+
+@router.post("/route-departures")
+def route_departures_start(request: Request, dto: sch.RouteStartIn = Body(...),
+                           actor: AuthUser = Depends(require_permission("sales-orders", "edit"))):
+    return camel(svc.start_route(dto, actor, request_meta(request)))
+
+
 @router.delete("/deliveries/{order_code}", status_code=204)
 def deliveries_delete(order_code: str, request: Request, actor: AuthUser = Depends(require_permission("sales-orders", "edit"))):
     svc.delete_delivery(order_code, actor, request_meta(request))

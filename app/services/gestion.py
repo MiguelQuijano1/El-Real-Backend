@@ -349,6 +349,58 @@ def upsert_delivery(code: str, dto: sch.DeliveryIn, actor: AuthUser, meta: Reque
     return _delivery_view(order["code"], saved)
 
 
+def _departure_out(r: dict[str, Any]) -> dict[str, Any]:
+    return {"vehicle": r["vehicle_plate"], "started_at": r["started_at"], "started_by": r["started_by_name"]}
+
+
+def list_route_departures(day: str) -> list[dict[str, Any]]:
+    return [_departure_out(r) for r in rows(
+        db().table("route_departures").select("vehicle_plate, started_at, started_by_name").eq("delivery_day", day))]
+
+
+async def _send_route_emails(orders: list[dict[str, Any]], extra: dict[str, Any]) -> None:
+    for o in orders:
+        await notif_svc.send_delivery_email(o, "dispatched", extra)
+
+
+def start_route(dto: sch.RouteStartIn, actor: AuthUser, meta: RequestMeta) -> dict[str, Any]:
+    """Marca la salida a ruta del vehículo ese día y avisa «en camino» a sus clientes aún sin entregar (una sola vez por orden)."""
+    vehicle = dto.vehicle.strip().upper()
+    found = rows(db().table("route_departures").select("vehicle_plate, started_at, started_by_name")
+                 .eq("vehicle_plate", vehicle).eq("delivery_day", dto.day))
+    if found:
+        departure = found[0]
+    else:
+        departure = execute(db().table("route_departures").upsert({
+            "vehicle_plate": vehicle, "delivery_day": dto.day,
+            "started_by_user_id": actor.id, "started_by_name": actor.full_name,
+        }, on_conflict="vehicle_plate,delivery_day")).data[0]
+        record(actor.actor, action="EDIT", module_key="sales-orders", entity_type="RouteDeparture", entity_id=None,
+               reference=vehicle, description=f"{vehicle} salió a ruta con las entregas del {dto.day}", meta=meta)
+
+    pending: list[dict[str, Any]] = []
+    for code in dict.fromkeys(c.strip() for c in dto.codes if c.strip()):
+        try:
+            order = _dispatched_order(code)
+        except ApiError:
+            continue
+        if first(db().table("delivery_confirmations").select("order_id").eq("order_id", order["id"])):
+            continue
+        pending.append({k: order.get(k) for k in ("id", "code", "party_name", "party_email", "party_address")})
+
+    ids = [o["id"] for o in pending]
+    already = {r["order_id"] for r in rows(
+        db().table("email_notifications_log").select("order_id").eq("event", "dispatched").is_("error", "null").in_("order_id", ids)
+    )} if ids else set()
+    to_send = [o for o in pending if o["id"] not in already and (o.get("party_email") or "").strip()]
+
+    smtp = notif_svc._get_smtp_config()
+    enabled = bool(smtp.get("enabled") and smtp.get("host"))
+    if enabled and to_send:
+        run_in_background(_send_route_emails, to_send, {"driver_name": dto.driver or "", "vehicle": vehicle})
+    return {**_departure_out(departure), "emails": len(to_send) if enabled else 0, "smtp_enabled": enabled}
+
+
 def delete_delivery(code: str, actor: AuthUser, meta: RequestMeta) -> None:
     order = find_by_id_or_code("business_orders", code, "id, code", kind="SALE")
     if not order:

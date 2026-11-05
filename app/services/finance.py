@@ -7,7 +7,9 @@ from typing import Any
 from app.core.errors import bad_request, not_found
 from app.repositories.client import db, execute, first, rows
 from app.security.deps import AuthUser
+from app.services import notifications as notif_svc
 from app.services.audit import RequestMeta, record
+from app.services.background import run_in_background
 
 # Perú (UTC−5): «hoy» se calcula en hora de Lima, no en la del servidor (UTC), para no marcar atrasos falsos de noche.
 _LIMA = timezone(timedelta(hours=-5))
@@ -116,6 +118,16 @@ def list_receivables(*, q: str | None = None, limit: int = 100, offset: int = 0)
     return {"items": items[offset : offset + limit], "total": total_n, "limit": limit, "offset": offset}
 
 
+def _soles(value: float) -> str:
+    return f"S/ {value:,.2f}"
+
+
+async def _notify_payment(order_id: str, extra: dict[str, Any]) -> None:
+    order = notif_svc.order_snapshot(order_id)
+    if order:
+        await notif_svc.send_delivery_email(order, "paid", extra)
+
+
 def collect_receivable(
     invoice_id: str,
     payload: dict[str, Any],
@@ -160,6 +172,10 @@ def collect_receivable(
         acc = first(db().table("bank_accounts").select("id").eq("is_active", True))
         bank_account_id = (acc or {}).get("id")
 
+    method = str(payload.get("payment_method") or "").upper()
+    if method not in notif_svc.PAYMENT_LABELS:
+        method = "CASH" if channel == "CASH" else "TRANSFER"
+
     code = _next_code("COB")
     now = datetime.now(timezone.utc).isoformat()
     row = {
@@ -169,7 +185,7 @@ def collect_receivable(
         "movement_type": "COLLECTION",
         "signed_amount": amount,  # cobro positivo
         "description": payload.get("description") or f"Cobro {inv.get('series')}-{inv.get('number')}",
-        "payment_method": payload.get("payment_method") or ("CASH" if channel == "CASH" else "TRANSFER"),
+        "payment_method": method,
         "operation_reference": payload.get("reference"),
         "bank_account_id": bank_account_id if channel == "BANK" else None,
         "sales_invoice_id": inv["id"],
@@ -182,6 +198,16 @@ def collect_receivable(
         entity_id=None, reference=code,
         description=f"Cobro {amount} · {inv.get('series')}-{inv.get('number')}", meta=meta,
     )
+    if inv.get("order_id"):
+        remaining = max(0.0, saldo - amount)
+        run_in_background(_notify_payment, inv["order_id"], {
+            "amount": _soles(amount),
+            "method": notif_svc.PAYMENT_LABELS[method],
+            "reference": payload.get("reference") or "",
+            "invoice": f"{inv.get('series')}-{inv.get('number')}" if inv.get("series") else "",
+            "balance": _soles(remaining),
+            "fully_paid": remaining <= 0.01,
+        })
     items = list_receivables(limit=200, offset=0)["items"]
     for i in items:
         if i["id"] == inv["id"]:

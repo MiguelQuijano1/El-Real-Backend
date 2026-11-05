@@ -22,7 +22,7 @@
   <p><strong>Dirección de entrega:</strong> {{ delivery_address }}</p>
   {% endif %}
   {% if driver_name %}
-  <p><strong>Repartidor:</strong> {{ driver_name }}</p>
+  <p><strong>Repartidor:</strong> {{ driver_name }}{% if vehicle %} · vehículo {{ vehicle }}{% endif %}</p>
   {% endif %}
   <p>Te avisaremos cuando sea entregado.</p>
   <div class="footer">{{ company_name }} · Este correo fue generado automáticamente.</div>

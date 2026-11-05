@@ -18,13 +18,26 @@ logger = logging.getLogger(__name__)
 _TEMPLATES_DIR = Path(__file__).parent.parent / "templates" / "email"
 _jinja = Environment(loader=FileSystemLoader(str(_TEMPLATES_DIR)), autoescape=True)
 
-EventType = Literal["dispatched", "delivered", "not_delivered"]
+EventType = Literal["dispatched", "delivered", "not_delivered", "paid"]
 
 _SUBJECTS: dict[str, str] = {
     "dispatched":    "Tu pedido {code} está en camino 🚚",
     "delivered":     "Tu pedido {code} fue entregado ✓",
     "not_delivered": "Aviso: no pudimos entregar tu pedido {code}",
+    "paid":          "Recibimos tu pago del pedido {code}",
 }
+
+PAYMENT_LABELS: dict[str, str] = {
+    "CASH": "Efectivo", "POS": "Tarjeta", "YAPE": "Yape", "PLIN": "Plin",
+    "TRANSFER": "Transferencia bancaria", "DEPOSIT": "Depósito bancario", "CHEQUE": "Cheque",
+}
+
+
+def order_snapshot(order_id: str) -> dict[str, Any] | None:
+    """Datos de la orden que necesitan los correos."""
+    return first(db().table("business_orders")
+                 .select("id, code, party_name, party_email, party_address")
+                 .eq("id", order_id))
 
 
 def _get_smtp_config() -> dict[str, Any]:

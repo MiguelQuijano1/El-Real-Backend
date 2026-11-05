@@ -10,7 +10,6 @@ from app.services.costing import get_average_cost
 from app.security.deps import AuthUser
 from app.services.audit import Actor, RequestMeta, record
 from app.services import geocoding as geo_svc
-from app.services import notifications as notif_svc
 from app.services.background import run_in_background
 
 MODULE = "sales-orders"
@@ -520,17 +519,9 @@ def complete_step(
         changes=[("current_step", str(step), str(step + 1))],
     )
 
-    # Disparar geocodificación y email de despacho de forma asíncrona (best-effort)
+    # Coordenadas de la dirección de entrega para el mapa (best-effort). El correo «en camino» sale al salir a ruta.
     if step == 2 and order.get("kind") == KIND_SALE:
-        order_snap = {
-            "id": order["id"],
-            "code": order["code"],
-            "party_name": order.get("party_name"),
-            "party_email": order.get("party_email"),
-            "party_address": order.get("party_address"),
-        }
         run_in_background(geo_svc.geocode_order, order["id"])
-        run_in_background(notif_svc.send_delivery_email, order_snap, "dispatched")
 
     return get_sale_order(order["id"])
 

@@ -118,3 +118,30 @@ async def test_smtp_test_endpoint_sends_with_saved_password():
         res = await test_smtp_settings()
     assert res == {"ok": True}
     assert send.call_args.kwargs["password"] == "abcdefghijklmnop"
+
+
+@pytest.mark.asyncio
+async def test_paid_email_shows_amount_and_method():
+    with (
+        patch("app.services.notifications._get_smtp_config", return_value={**CFG, "enabled": True}),
+        patch("app.services.notifications._send_smtp", new_callable=AsyncMock) as send,
+        patch("app.services.notifications._log_email"),
+    ):
+        from app.services.notifications import send_delivery_email
+        await send_delivery_email(ORDER, "paid", {"amount": "S/ 51.68", "method": "Yape", "reference": "", "invoice": "B001-12",
+                                                  "balance": "S/ 0.00", "fully_paid": True})
+    kw = send.call_args.kwargs
+    assert kw["subject"] == "Recibimos tu pago del pedido OV-2026-0001"
+    assert "S/ 51.68" in kw["html_body"] and "Yape" in kw["html_body"] and "pagado por completo" in kw["html_body"]
+
+
+@pytest.mark.asyncio
+async def test_on_the_way_email_shows_driver_and_vehicle():
+    with (
+        patch("app.services.notifications._get_smtp_config", return_value={**CFG, "enabled": True}),
+        patch("app.services.notifications._send_smtp", new_callable=AsyncMock) as send,
+        patch("app.services.notifications._log_email"),
+    ):
+        from app.services.notifications import send_delivery_email
+        await send_delivery_email(ORDER, "dispatched", {"driver_name": "Wilber Miranda", "vehicle": "F3Q-920"})
+    assert "Wilber Miranda" in send.call_args.kwargs["html_body"] and "F3Q-920" in send.call_args.kwargs["html_body"]
