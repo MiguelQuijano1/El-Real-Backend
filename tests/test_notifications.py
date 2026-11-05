@@ -58,3 +58,63 @@ async def test_no_email_when_no_party_email():
         await send_delivery_email(order_no_email, "dispatched")
 
     mock_send.assert_not_called()
+
+
+# ── send_message: conexión, contraseña y reintento por 465 ──────────────────
+import aiosmtplib
+
+CFG = {"host": "smtp.gmail.com", "port": 587, "username": "yo@gmail.com",
+       "password": "abcd efgh ijkl mnop", "from_address": "yo@gmail.com", "use_tls": True}
+
+
+@pytest.mark.asyncio
+async def test_send_message_uses_starttls_and_strips_password_spaces():
+    with patch("app.services.notifications.aiosmtplib.send", new_callable=AsyncMock) as send:
+        from app.services.notifications import send_message
+        await send_message(MagicMock(), CFG)
+    kw = send.call_args.kwargs
+    assert kw["port"] == 587 and kw["start_tls"] is True and kw["use_tls"] is False
+    assert kw["password"] == "abcdefghijklmnop"
+
+
+@pytest.mark.asyncio
+async def test_send_message_retries_on_465_when_587_disconnects():
+    send = AsyncMock(side_effect=[aiosmtplib.SMTPServerDisconnected("Unexpected EOF received"), None])
+    with patch("app.services.notifications.aiosmtplib.send", send):
+        from app.services.notifications import send_message
+        await send_message(MagicMock(), CFG)
+    second = send.call_args_list[1].kwargs
+    assert second["port"] == 465 and second["use_tls"] is True and second["start_tls"] is False
+
+
+@pytest.mark.asyncio
+async def test_send_message_explains_disconnect_on_both_ports():
+    send = AsyncMock(side_effect=aiosmtplib.SMTPServerDisconnected("Unexpected EOF received"))
+    with patch("app.services.notifications.aiosmtplib.send", send):
+        from app.services.notifications import SmtpSendError, send_message
+        with pytest.raises(SmtpSendError) as err:
+            await send_message(MagicMock(), CFG)
+    assert "587 y 465" in str(err.value) and "red" in str(err.value)
+
+
+@pytest.mark.asyncio
+async def test_send_message_explains_bad_password_without_retry():
+    send = AsyncMock(side_effect=aiosmtplib.SMTPAuthenticationError(535, "Username and Password not accepted"))
+    with patch("app.services.notifications.aiosmtplib.send", send):
+        from app.services.notifications import SmtpSendError, send_message
+        with pytest.raises(SmtpSendError) as err:
+            await send_message(MagicMock(), CFG)
+    assert send.await_count == 1
+    assert "contraseña de aplicación" in str(err.value)
+
+
+@pytest.mark.asyncio
+async def test_smtp_test_endpoint_sends_with_saved_password():
+    with (
+        patch("app.services.notifications._get_smtp_config", return_value={**CFG, "enabled": True}),
+        patch("app.services.notifications.aiosmtplib.send", new_callable=AsyncMock) as send,
+    ):
+        from app.services.gestion import test_smtp_settings
+        res = await test_smtp_settings()
+    assert res == {"ok": True}
+    assert send.call_args.kwargs["password"] == "abcdefghijklmnop"

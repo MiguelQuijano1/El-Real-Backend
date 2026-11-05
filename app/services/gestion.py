@@ -512,24 +512,27 @@ def save_smtp_settings(dto: "sch.SmtpSettingsIn") -> dict[str, Any]:
 
 
 async def test_smtp_settings() -> dict[str, Any]:
-    """Envía un email de prueba con la configuración guardada en BD."""
-    cfg = get_smtp_settings()
+    """Envía un correo de prueba a la cuenta configurada, con la contraseña guardada en BD."""
+    from email.mime.text import MIMEText
+
+    from app.services.notifications import SmtpSendError, _get_smtp_config, send_message
+
+    cfg = _get_smtp_config()
     if not cfg.get("host"):
         return {"ok": False, "error": "No hay host SMTP configurado"}
-    import aiosmtplib
-    from email.mime.text import MIMEText
-    msg = MIMEText("Correo de prueba desde EnterpriseCloud ERP.", "plain", "utf-8")
+    if cfg.get("username") and not cfg.get("password"):
+        return {"ok": False, "error": "Falta la contraseña. Escríbela y guarda antes de probar."}
+    to = cfg.get("username") or cfg.get("from_address")
+    if not to:
+        return {"ok": False, "error": "Escribe el usuario o el remitente para saber a quién enviar la prueba"}
+    msg = MIMEText("Correo de prueba desde EnterpriseCloud ERP. Si lo recibes, las notificaciones están listas.", "plain", "utf-8")
     msg["Subject"] = "Prueba de correo — EnterpriseCloud"
-    msg["From"] = cfg.get("from_address") or cfg["host"]
-    msg["To"] = cfg.get("username") or cfg["host"]
+    msg["From"] = cfg.get("from_address") or to
+    msg["To"] = to
     try:
-        await aiosmtplib.send(
-            msg, hostname=cfg["host"], port=int(cfg.get("port", 587)),
-            username=cfg.get("username", ""), password=cfg.get("password", ""),
-            start_tls=bool(cfg.get("use_tls", True)),
-        )
+        await send_message(msg, cfg)
         return {"ok": True}
-    except Exception as exc:
+    except SmtpSendError as exc:
         return {"ok": False, "error": str(exc)}
 
 

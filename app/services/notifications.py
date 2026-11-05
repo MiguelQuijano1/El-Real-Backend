@@ -44,20 +44,69 @@ def _log_email(order_id: str, event: str, to_email: str, error: str | None) -> N
         logger.warning("No se pudo registrar email en log: %s", exc)
 
 
-async def _send_smtp(*, host: str, port: int, username: str, password: str,
-                     from_address: str, use_tls: bool,
-                     to_email: str, subject: str, html_body: str) -> None:
+class SmtpSendError(Exception):
+    """Fallo de envío con un mensaje en español que se puede mostrar al usuario."""
+
+
+def _explain(exc: Exception, host: str, ports: list[int]) -> str:
+    tried = " y ".join(str(p) for p in ports)
+    if isinstance(exc, aiosmtplib.SMTPAuthenticationError):
+        return ("El servidor rechazó el usuario o la contraseña. En Gmail usa una contraseña de aplicación "
+                "(myaccount.google.com/apppasswords), no la de tu cuenta, y el correo completo como usuario.")
+    if isinstance(exc, aiosmtplib.SMTPSenderRefused):
+        return "El servidor no acepta este remitente. En Gmail el remitente debe ser el mismo correo del usuario."
+    if isinstance(exc, aiosmtplib.SMTPRecipientsRefused):
+        return "El servidor rechazó el correo del destinatario. Revisa que esté bien escrito."
+    if isinstance(exc, aiosmtplib.SMTPServerDisconnected):
+        return (f"{host} cerró la conexión antes de terminar (puerto {tried}). Suele pasar cuando la red bloquea "
+                "el envío de correo (común en redes institucionales) o un antivirus revisa el correo saliente. "
+                "Prueba desde otra red o desactiva el escudo de correo del antivirus.")
+    if isinstance(exc, (aiosmtplib.SMTPConnectError, aiosmtplib.SMTPConnectTimeoutError, aiosmtplib.SMTPTimeoutError, OSError)):
+        return (f"No se pudo conectar a {host} (puerto {tried}). Revisa el host y que la red permita la salida "
+                "por ese puerto.")
+    return f"Error SMTP: {exc}"
+
+
+async def send_message(msg: Any, cfg: dict[str, Any]) -> None:
+    """Envía `msg` con la configuración SMTP guardada. Si el puerto 587 corta la conexión, reintenta por 465 (TLS directo)."""
+    host = (cfg.get("host") or "").strip()
+    port = int(cfg.get("port") or 587)
+    username = (cfg.get("username") or "").strip()
+    # Gmail muestra la contraseña de aplicación en grupos separados por espacios.
+    password = (cfg.get("password") or "").replace(" ", "")
+    secure = bool(cfg.get("use_tls", True))
+    auth = {"username": username, "password": password} if username else {}
+
+    async def attempt(p: int) -> None:
+        implicit = secure and p == 465
+        await aiosmtplib.send(msg, hostname=host, port=p, timeout=20,
+                              use_tls=implicit, start_tls=secure and not implicit, **auth)
+
+    ports = [port]
+    try:
+        await attempt(port)
+        return
+    except (aiosmtplib.SMTPServerDisconnected, aiosmtplib.SMTPConnectError, aiosmtplib.SMTPConnectTimeoutError) as exc:
+        if not secure or port == 465:
+            raise SmtpSendError(_explain(exc, host, ports)) from exc
+        logger.info("SMTP %s:%s falló (%s); reintentando por 465", host, port, exc)
+    except Exception as exc:
+        raise SmtpSendError(_explain(exc, host, ports)) from exc
+
+    ports.append(465)
+    try:
+        await attempt(465)
+    except Exception as exc:
+        raise SmtpSendError(_explain(exc, host, ports)) from exc
+
+
+async def _send_smtp(*, cfg: dict[str, Any], to_email: str, subject: str, html_body: str) -> None:
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = from_address
+    msg["From"] = cfg.get("from_address") or cfg.get("username") or ""
     msg["To"] = to_email
     msg.attach(MIMEText(html_body, "html", "utf-8"))
-    await aiosmtplib.send(
-        msg,
-        hostname=host, port=port,
-        username=username, password=password,
-        start_tls=use_tls,
-    )
+    await send_message(msg, cfg)
 
 
 async def send_delivery_email(
@@ -87,13 +136,7 @@ async def send_delivery_email(
 
     error_msg: str | None = None
     try:
-        await _send_smtp(
-            host=cfg["host"], port=int(cfg.get("port", 587)),
-            username=cfg.get("username", ""), password=cfg.get("password", ""),
-            from_address=cfg.get("from_address", cfg["host"]),
-            use_tls=bool(cfg.get("use_tls", True)),
-            to_email=to_email, subject=subject, html_body=html_body,
-        )
+        await _send_smtp(cfg=cfg, to_email=to_email, subject=subject, html_body=html_body)
         logger.info("Email '%s' enviado a %s para %s", event, to_email, code)
     except Exception as exc:
         error_msg = str(exc)
