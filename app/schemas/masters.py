@@ -122,3 +122,4 @@ class VehicleIn(ApiModel):
     carrier_supplier_id: UUID | None = None
     default_driver_id: UUID | None = None
     status: RecordStatus = "ACTIVE"
+    zones: list[str] = []

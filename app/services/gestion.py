@@ -11,6 +11,8 @@ from app.repositories.client import db, execute, find_by_id_or_code, first, rows
 from app.schemas import gestion as sch
 from app.security.deps import AuthUser
 from app.services import inventory as inventory_svc
+from app.services import notifications as notif_svc
+from app.services.background import run_in_background
 from app.services.audit import RequestMeta, record
 
 MODULE_IDS = ("reposicion", "flujoCaja", "metas", "comisiones", "conteo", "entregas")
@@ -294,7 +296,11 @@ def list_deliveries(codes: list[str]) -> list[dict[str, Any]]:
 
 
 def _dispatched_order(code: str) -> dict[str, Any]:
-    order = find_by_id_or_code("business_orders", code, "id, code, is_cancelled, current_step", kind="SALE")
+    order = find_by_id_or_code(
+        "business_orders", code,
+        "id, code, is_cancelled, current_step, party_name, party_email, party_address",
+        kind="SALE",
+    )
     if not order:
         raise not_found("Sales order not found")
     if order["is_cancelled"] or int(order["current_step"] or 1) < 3:
@@ -321,7 +327,78 @@ def upsert_delivery(code: str, dto: sch.DeliveryIn, actor: AuthUser, meta: Reque
     label = "entregada" if dto.status == "DELIVERED" else "no entregada"
     record(actor.actor, action="EDIT", module_key="sales-orders", entity_type="DeliveryConfirmation", entity_id=order["id"],
            reference=order["code"], description=f"Entrega de {order['code']} marcada como {label}", meta=meta)
+
+    # Email de seguimiento al cliente (best-effort, no bloquea)
+    order_snap = {
+        "id": order["id"],
+        "code": order["code"],
+        "party_name": order.get("party_name"),
+        "party_email": order.get("party_email"),
+        "party_address": order.get("party_address"),
+    }
+    extra: dict[str, Any] = {}
+    if dto.status == "DELIVERED":
+        event = "delivered"
+        extra = {"receiver": dto.receiver or ""}
+    else:
+        event = "not_delivered"
+        extra = {"reason": dto.reason or "", "note": dto.note or ""}
+
+    run_in_background(notif_svc.send_delivery_email, order_snap, event, extra)
+
     return _delivery_view(order["code"], saved)
+
+
+def _departure_out(r: dict[str, Any]) -> dict[str, Any]:
+    return {"vehicle": r["vehicle_plate"], "started_at": r["started_at"], "started_by": r["started_by_name"]}
+
+
+def list_route_departures(day: str) -> list[dict[str, Any]]:
+    return [_departure_out(r) for r in rows(
+        db().table("route_departures").select("vehicle_plate, started_at, started_by_name").eq("delivery_day", day))]
+
+
+async def _send_route_emails(orders: list[dict[str, Any]], extra: dict[str, Any]) -> None:
+    for o in orders:
+        await notif_svc.send_delivery_email(o, "dispatched", extra)
+
+
+def start_route(dto: sch.RouteStartIn, actor: AuthUser, meta: RequestMeta) -> dict[str, Any]:
+    """Marca la salida a ruta del vehículo ese día y avisa «en camino» a sus clientes aún sin entregar (una sola vez por orden)."""
+    vehicle = dto.vehicle.strip().upper()
+    found = rows(db().table("route_departures").select("vehicle_plate, started_at, started_by_name")
+                 .eq("vehicle_plate", vehicle).eq("delivery_day", dto.day))
+    if found:
+        departure = found[0]
+    else:
+        departure = execute(db().table("route_departures").upsert({
+            "vehicle_plate": vehicle, "delivery_day": dto.day,
+            "started_by_user_id": actor.id, "started_by_name": actor.full_name,
+        }, on_conflict="vehicle_plate,delivery_day")).data[0]
+        record(actor.actor, action="EDIT", module_key="sales-orders", entity_type="RouteDeparture", entity_id=None,
+               reference=vehicle, description=f"{vehicle} salió a ruta con las entregas del {dto.day}", meta=meta)
+
+    pending: list[dict[str, Any]] = []
+    for code in dict.fromkeys(c.strip() for c in dto.codes if c.strip()):
+        try:
+            order = _dispatched_order(code)
+        except ApiError:
+            continue
+        if first(db().table("delivery_confirmations").select("order_id").eq("order_id", order["id"])):
+            continue
+        pending.append({k: order.get(k) for k in ("id", "code", "party_name", "party_email", "party_address")})
+
+    ids = [o["id"] for o in pending]
+    already = {r["order_id"] for r in rows(
+        db().table("email_notifications_log").select("order_id").eq("event", "dispatched").is_("error", "null").in_("order_id", ids)
+    )} if ids else set()
+    to_send = [o for o in pending if o["id"] not in already and (o.get("party_email") or "").strip()]
+
+    smtp = notif_svc._get_smtp_config()
+    enabled = bool(smtp.get("enabled") and smtp.get("host"))
+    if enabled and to_send:
+        run_in_background(_send_route_emails, to_send, {"driver_name": dto.driver or "", "vehicle": vehicle})
+    return {**_departure_out(departure), "emails": len(to_send) if enabled else 0, "smtp_enabled": enabled}
 
 
 def delete_delivery(code: str, actor: AuthUser, meta: RequestMeta) -> None:
@@ -331,6 +408,179 @@ def delete_delivery(code: str, actor: AuthUser, meta: RequestMeta) -> None:
     execute(db().table("delivery_confirmations").delete().eq("order_id", order["id"]))
     record(actor.actor, action="EDIT", module_key="sales-orders", entity_type="DeliveryConfirmation", entity_id=order["id"],
            reference=order["code"], description=f"Entrega de {order['code']} vuelta a pendiente", meta=meta)
+
+
+# ═════════════════════════════ Mapa de entregas ═════════════════════════════
+
+def _delivery_status(confirmation: dict[str, Any] | None) -> str:
+    if not confirmation:
+        return "Pendiente"
+    return "Entregado" if confirmation["status"] == "DELIVERED" else "No entregado"
+
+
+def _get_warehouses() -> list[dict[str, Any]]:
+    whs = rows(db().table("warehouses").select("name, address, lat, lng").eq("status", "ACTIVE"))
+    return [{"name": w["name"], "address": w.get("address"), "lat": w.get("lat"), "lng": w.get("lng")} for w in whs]
+
+
+def _dispatch_form_data(order_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Devuelve {order_id: form_data} del step de despacho (step_no=2) para las órdenes indicadas."""
+    out: dict[str, dict[str, Any]] = {}
+    for i in range(0, len(order_ids), CHUNK):
+        for ev in rows(
+            db().table("order_step_events")
+            .select("order_id, form_data")
+            .in_("order_id", order_ids[i:i + CHUNK])
+            .eq("step_no", 2)
+        ):
+            out[ev["order_id"]] = ev.get("form_data") or {}
+    return out
+
+
+def get_map(day: str) -> dict[str, Any]:
+    """Stops del día con lat/lng + almacenes. day = 'YYYY-MM-DD'.
+
+    La fecha de entrega (ent) se guarda en form_data del paso de despacho (step_no=2).
+    El vehículo (pla) y conductor (con) también vienen de ese form_data.
+    """
+    # 1. Obtener todos los pedidos despachados (current_step >= 3, no anulados)
+    all_orders = _all(lambda: (
+        db().table("business_orders")
+        .select("id, code, party_name, party_address, delivery_lat, delivery_lng")
+        .eq("kind", "SALE")
+        .eq("is_cancelled", False)
+        .gte("current_step", 3)
+    ))
+    if not all_orders:
+        return {"stops": [], "warehouses": _get_warehouses()}
+
+    all_ids = [o["id"] for o in all_orders]
+
+    # 2. Leer form_data del paso de despacho para filtrar por fecha de entrega (ent)
+    dispatch_fd = _dispatch_form_data(all_ids)
+
+    # 3. Filtrar por día — 'ent' en step 2; algunos pedidos lo guardan en step 1
+    step1_fd: dict[str, dict[str, Any]] = {}
+    orders_no_step2 = [oid for oid in all_ids if oid not in dispatch_fd]
+    if orders_no_step2:
+        for i in range(0, len(orders_no_step2), CHUNK):
+            for ev in rows(
+                db().table("order_step_events")
+                .select("order_id, form_data")
+                .in_("order_id", orders_no_step2[i:i + CHUNK])
+                .eq("step_no", 1)
+            ):
+                step1_fd[ev["order_id"]] = ev.get("form_data") or {}
+
+    orders_today_ids: set[str] = set()
+    for o in all_orders:
+        oid = o["id"]
+        fd2 = dispatch_fd.get(oid) or {}
+        fd1 = step1_fd.get(oid) or {}
+        ent = fd2.get("ent") or fd1.get("ent") or ""
+        if ent == day:
+            orders_today_ids.add(oid)
+
+    orders = [o for o in all_orders if o["id"] in orders_today_ids]
+    if not orders:
+        return {"stops": [], "warehouses": _get_warehouses()}
+
+    order_ids = [o["id"] for o in orders]
+
+    # 4. Confirmaciones de entrega
+    confirmations: dict[str, dict[str, Any]] = {}
+    for i in range(0, len(order_ids), CHUNK):
+        for c in rows(db().table("delivery_confirmations").select("*").in_("order_id", order_ids[i:i + CHUNK])):
+            confirmations[c["order_id"]] = c
+
+    # 5. Zonas de vehículos que aparecen hoy
+    plates = list({(dispatch_fd.get(oid) or {}).get("pla") or "" for oid in order_ids
+                   if (dispatch_fd.get(oid) or {}).get("pla")})
+    vehicle_zones: dict[str, list[str]] = {}
+    if plates:
+        for v in rows(db().table("vehicles").select("plate, zones").in_("plate", plates)):
+            vehicle_zones[v["plate"]] = v.get("zones") or []
+
+    # 6. Construir stops
+    stops = []
+    for seq, o in enumerate(orders, 1):
+        fd = dispatch_fd.get(o["id"]) or step1_fd.get(o["id"]) or {}
+        plate = fd.get("pla") or "Sin vehículo"
+        driver = fd.get("con") or ""
+        stops.append({
+            "code": o["code"],
+            "client": o.get("party_name") or "",
+            "address": o.get("party_address") or "",
+            "lat": o.get("delivery_lat"),
+            "lng": o.get("delivery_lng"),
+            "vehicle": plate,
+            "driver": driver,
+            "status": _delivery_status(confirmations.get(o["id"])),
+            "seq": seq,
+            "zones": vehicle_zones.get(plate, []),
+        })
+
+    return {"stops": stops, "warehouses": _get_warehouses()}
+
+
+def get_route(plate: str, day: str) -> dict[str, Any]:
+    """Stops del vehículo indicado en el día indicado (para la vista del repartidor)."""
+    result = get_map(day)
+    vehicle_stops = [s for s in result["stops"] if s["vehicle"] == plate]
+    vehicle_info = first(db().table("vehicles").select("plate, zones").eq("plate", plate))
+    driver_name = vehicle_stops[0]["driver"] if vehicle_stops else ""
+    return {
+        "vehicle": plate,
+        "driver": driver_name,
+        "zones": (vehicle_info or {}).get("zones") or [],
+        "stops": vehicle_stops,
+    }
+
+
+# ═════════════════════════════ Configuración SMTP ═════════════════════════════
+
+def get_smtp_settings() -> dict[str, Any]:
+    row = first(db().table("smtp_settings").select("host, port, username, from_address, use_tls, enabled").eq("id", 1))
+    if not row:
+        return {"host": "", "port": 587, "username": "", "from_address": "", "use_tls": True, "enabled": False}
+    return row
+
+
+def save_smtp_settings(dto: "sch.SmtpSettingsIn") -> dict[str, Any]:
+    patch: dict[str, Any] = {
+        "host": dto.host, "port": dto.port, "username": dto.username,
+        "from_address": dto.from_address, "use_tls": dto.use_tls,
+        "enabled": dto.enabled, "updated_at": _now(),
+    }
+    if dto.password is not None:
+        patch["password"] = dto.password
+    execute(db().table("smtp_settings").update(patch).eq("id", 1))
+    return get_smtp_settings()
+
+
+async def test_smtp_settings() -> dict[str, Any]:
+    """Envía un correo de prueba a la cuenta configurada, con la contraseña guardada en BD."""
+    from email.mime.text import MIMEText
+
+    from app.services.notifications import SmtpSendError, _get_smtp_config, send_message
+
+    cfg = _get_smtp_config()
+    if not cfg.get("host"):
+        return {"ok": False, "error": "No hay host SMTP configurado"}
+    if cfg.get("username") and not cfg.get("password"):
+        return {"ok": False, "error": "Falta la contraseña. Escríbela y guarda antes de probar."}
+    to = cfg.get("username") or cfg.get("from_address")
+    if not to:
+        return {"ok": False, "error": "Escribe el usuario o el remitente para saber a quién enviar la prueba"}
+    msg = MIMEText("Correo de prueba desde EnterpriseCloud ERP. Si lo recibes, las notificaciones están listas.", "plain", "utf-8")
+    msg["Subject"] = "Prueba de correo — EnterpriseCloud"
+    msg["From"] = cfg.get("from_address") or to
+    msg["To"] = to
+    try:
+        await send_message(msg, cfg)
+        return {"ok": True}
+    except SmtpSendError as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 # ═════════════════════════════ Flujo de caja ═════════════════════════════

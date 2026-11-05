@@ -133,10 +133,67 @@ def deliveries_put(order_code: str, request: Request, dto: sch.DeliveryIn = Body
     return camel(svc.upsert_delivery(order_code, dto, actor, request_meta(request)))
 
 
+@router.get("/route-departures")
+def route_departures_list(day: str, _: AuthUser = Depends(require_permission("sales-orders", "view"))):
+    return camel({"items": svc.list_route_departures(day)})
+
+
+@router.post("/route-departures")
+def route_departures_start(request: Request, dto: sch.RouteStartIn = Body(...),
+                           actor: AuthUser = Depends(require_permission("sales-orders", "edit"))):
+    return camel(svc.start_route(dto, actor, request_meta(request)))
+
+
 @router.delete("/deliveries/{order_code}", status_code=204)
 def deliveries_delete(order_code: str, request: Request, actor: AuthUser = Depends(require_permission("sales-orders", "edit"))):
     svc.delete_delivery(order_code, actor, request_meta(request))
     return Response(status_code=204)
+
+
+# ---- Mapa de entregas ----
+
+@router.get("/entregas/mapa")
+def entregas_mapa(
+    day: str = Query(pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    _: AuthUser = Depends(require_permission("sales-orders", "view")),
+):
+    return camel(svc.get_map(day))
+
+
+@router.get("/entregas/ruta/{plate}")
+def entregas_ruta(
+    plate: str,
+    day: str = Query(pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    _: AuthUser = Depends(authenticated),
+):
+    return camel(svc.get_route(plate, day))
+
+
+@router.post("/entregas/geocode/{order_code}", status_code=200)
+async def entregas_geocode(
+    order_code: str,
+    _: AuthUser = Depends(require_permission("sales-orders", "edit")),
+):
+    from app.services.geocoding import geocode_order_by_code
+    found = await geocode_order_by_code(order_code)
+    return {"found": found}
+
+
+# ---- SMTP ----
+
+@router.get("/smtp-settings")
+def smtp_get(_: AuthUser = Depends(_settings_edit)):
+    return camel(svc.get_smtp_settings())
+
+
+@router.put("/smtp-settings")
+def smtp_put(request: Request, dto: sch.SmtpSettingsIn = Body(...), _: AuthUser = Depends(_settings_edit)):
+    return camel(svc.save_smtp_settings(dto))
+
+
+@router.post("/smtp-settings/test")
+async def smtp_test(_: AuthUser = Depends(_settings_edit)):
+    return await svc.test_smtp_settings()
 
 
 # ---- Flujo de caja ----

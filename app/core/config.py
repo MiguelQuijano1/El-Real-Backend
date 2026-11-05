@@ -39,6 +39,15 @@ class Settings(BaseSettings):
     seed_admin_name: str = "Administrador del sistema"
     seed_admin_password: str | None = None
 
+    # ── Notificaciones por correo (opcional) ──────────────────────────────────
+    # Dejar smtp_host vacío para desactivar completamente el envío de emails.
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_use_tls: bool = True
+
     @field_validator("jwt_secret")
     @classmethod
     def _jwt_secret_strong(cls, v: str) -> str:

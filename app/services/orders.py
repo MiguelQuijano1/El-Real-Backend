@@ -9,6 +9,8 @@ from app.repositories.client import db, execute, find_by_id_or_code, first, rows
 from app.services.costing import get_average_cost
 from app.security.deps import AuthUser
 from app.services.audit import Actor, RequestMeta, record
+from app.services import geocoding as geo_svc
+from app.services.background import run_in_background
 
 MODULE = "sales-orders"
 KIND_SALE = "SALE"
@@ -516,6 +518,11 @@ def complete_step(
         meta=meta,
         changes=[("current_step", str(step), str(step + 1))],
     )
+
+    # Coordenadas de la dirección de entrega para el mapa (best-effort). El correo «en camino» sale al salir a ruta.
+    if step == 2 and order.get("kind") == KIND_SALE:
+        run_in_background(geo_svc.geocode_order, order["id"])
+
     return get_sale_order(order["id"])
 
 
