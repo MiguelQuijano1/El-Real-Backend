@@ -145,3 +145,52 @@ async def test_on_the_way_email_shows_driver_and_vehicle():
         from app.services.notifications import send_delivery_email
         await send_delivery_email(ORDER, "dispatched", {"driver_name": "Wilber Miranda", "vehicle": "F3Q-920"})
     assert "Wilber Miranda" in send.call_args.kwargs["html_body"] and "F3Q-920" in send.call_args.kwargs["html_body"]
+
+
+@pytest.mark.asyncio
+async def test_arrived_email_subject_and_body():
+    with (
+        patch("app.services.notifications._get_smtp_config", return_value={**CFG, "enabled": True}),
+        patch("app.services.notifications._send_smtp", new_callable=AsyncMock) as send,
+        patch("app.services.notifications._log_email"),
+    ):
+        from app.services.notifications import send_delivery_email
+        await send_delivery_email(ORDER, "arrived", {"driver_name": "Wilber Miranda", "vehicle": "F3Q-920"})
+    kw = send.call_args.kwargs
+    assert kw["subject"] == "El vehículo con tu pedido OV-2026-0001 llegó a tu ubicación"
+    assert "llegó a tu ubicación" in kw["html_body"] and "F3Q-920" in kw["html_body"]
+
+
+def _arrival(delivered=False, sent=False, email="cliente@acme.pe", enabled=True):
+    order = {**ORDER, "party_email": email, "is_cancelled": False, "current_step": 4}
+    q = MagicMock()
+    with (
+        patch("app.services.gestion._dispatched_order", return_value=order),
+        patch("app.services.gestion.notif_svc._get_smtp_config", return_value={"enabled": enabled, "host": "h"}),
+        patch("app.services.gestion.first", return_value={"order_id": "x"} if delivered else None),
+        patch("app.services.gestion.rows", return_value=[{"order_id": "x"}] if sent else []),
+        patch("app.services.gestion.db", return_value=q),
+        patch("app.services.gestion.run_in_background") as bg,
+    ):
+        from app.schemas.gestion import ArrivalIn
+        from app.services.gestion import notify_arrival
+        res = notify_arrival("OV-2026-0001", ArrivalIn(vehicle="f3q-920", driver="Wilber"))
+    return res, bg
+
+
+def test_arrival_sends_once():
+    res, bg = _arrival()
+    assert res == {"emailed": True, "reason": None}
+    assert bg.call_args.args[2] == "arrived" and bg.call_args.args[3]["vehicle"] == "F3Q-920"
+
+
+@pytest.mark.parametrize("kw,reason", [
+    ({"delivered": True}, "already_delivered"),
+    ({"sent": True}, "already_notified"),
+    ({"email": ""}, "no_email"),
+    ({"enabled": False}, "smtp_disabled"),
+])
+def test_arrival_skips(kw, reason):
+    res, bg = _arrival(**kw)
+    assert res == {"emailed": False, "reason": reason}
+    bg.assert_not_called()

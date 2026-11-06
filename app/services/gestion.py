@@ -363,6 +363,25 @@ async def _send_route_emails(orders: list[dict[str, Any]], extra: dict[str, Any]
         await notif_svc.send_delivery_email(o, "dispatched", extra)
 
 
+def notify_arrival(code: str, dto: sch.ArrivalIn) -> dict[str, Any]:
+    """Avisa al cliente que el vehículo llegó a su dirección. Una sola vez por orden; nada si ya se entregó."""
+    order = _dispatched_order(code)
+    smtp = notif_svc._get_smtp_config()
+    enabled = bool(smtp.get("enabled") and smtp.get("host"))
+    email = (order.get("party_email") or "").strip()
+    delivered = first(db().table("delivery_confirmations").select("order_id").eq("order_id", order["id"]))
+    sent = rows(db().table("email_notifications_log").select("order_id")
+                .eq("order_id", order["id"]).eq("event", "arrived").is_("error", "null"))
+    if delivered or sent or not email or not enabled:
+        reason = ("already_delivered" if delivered else "already_notified" if sent
+                  else "no_email" if not email else "smtp_disabled")
+        return {"emailed": False, "reason": reason}
+    snap = {k: order.get(k) for k in ("id", "code", "party_name", "party_email", "party_address")}
+    run_in_background(notif_svc.send_delivery_email, snap, "arrived",
+                      {"driver_name": dto.driver or "", "vehicle": (dto.vehicle or "").upper()})
+    return {"emailed": True, "reason": None}
+
+
 def start_route(dto: sch.RouteStartIn, actor: AuthUser, meta: RequestMeta) -> dict[str, Any]:
     """Marca la salida a ruta del vehículo ese día y avisa «en camino» a sus clientes aún sin entregar (una sola vez por orden)."""
     vehicle = dto.vehicle.strip().upper()

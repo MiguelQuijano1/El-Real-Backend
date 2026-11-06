@@ -18,13 +18,14 @@ logger = logging.getLogger(__name__)
 _TEMPLATES_DIR = Path(__file__).parent.parent / "templates" / "email"
 _jinja = Environment(loader=FileSystemLoader(str(_TEMPLATES_DIR)), autoescape=True)
 
-EventType = Literal["dispatched", "delivered", "not_delivered", "paid"]
+EventType = Literal["dispatched", "delivered", "not_delivered", "paid", "arrived"]
 
 _SUBJECTS: dict[str, str] = {
     "dispatched":    "Tu pedido {code} está en camino 🚚",
     "delivered":     "Tu pedido {code} fue entregado ✓",
     "not_delivered": "Aviso: no pudimos entregar tu pedido {code}",
     "paid":          "Recibimos tu pago del pedido {code}",
+    "arrived":       "El vehículo con tu pedido {code} llegó a tu ubicación",
 }
 
 PAYMENT_LABELS: dict[str, str] = {
