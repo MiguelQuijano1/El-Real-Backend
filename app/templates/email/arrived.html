@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>El vehículo llegó</title>
+<style>
+  body { font-family: Arial, sans-serif; background: #f5f5f5; margin: 0; padding: 20px; }
+  .card { background: #fff; border-radius: 8px; max-width: 520px; margin: 0 auto; padding: 32px; }
+  .badge { display: inline-block; background: #7c3aed; color: #fff; border-radius: 4px; padding: 4px 12px; font-size: 13px; font-weight: 600; margin-bottom: 20px; }
+  h1 { font-size: 20px; margin: 0 0 12px; color: #111; }
+  p { color: #444; line-height: 1.6; margin: 0 0 12px; }
+  .code { font-family: monospace; background: #f0f0f0; padding: 2px 6px; border-radius: 3px; }
+  .footer { margin-top: 24px; font-size: 12px; color: #888; border-top: 1px solid #eee; padding-top: 16px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="badge">📍 Llegó</div>
+  <h1>El vehículo llegó a tu ubicación</h1>
+  <p>Hola {{ client_name }},</p>
+  <p>El vehículo con tu pedido <span class="code">{{ order_code }}</span> acaba de llegar a la dirección de entrega.</p>
+  {% if delivery_address %}
+  <p><strong>Dirección:</strong> {{ delivery_address }}</p>
+  {% endif %}
+  {% if driver_name %}
+  <p><strong>Repartidor:</strong> {{ driver_name }}{% if vehicle %} · vehículo {{ vehicle }}{% endif %}</p>
+  {% endif %}
+  <p>Por favor, ten a alguien disponible para recibirlo.</p>
+  <div class="footer">{{ company_name }} · Este correo fue generado automáticamente.</div>
+</div>
+</body>
+</html>

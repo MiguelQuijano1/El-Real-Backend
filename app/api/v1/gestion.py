@@ -133,6 +133,12 @@ def deliveries_put(order_code: str, request: Request, dto: sch.DeliveryIn = Body
     return camel(svc.upsert_delivery(order_code, dto, actor, request_meta(request)))
 
 
+@router.post("/deliveries/{order_code}/arrival")
+def deliveries_arrival(order_code: str, dto: sch.ArrivalIn = Body(...),
+                       _: AuthUser = Depends(require_permission("sales-orders", "edit"))):
+    return camel(svc.notify_arrival(order_code, dto))
+
+
 @router.get("/route-departures")
 def route_departures_list(day: str, _: AuthUser = Depends(require_permission("sales-orders", "view"))):
     return camel({"items": svc.list_route_departures(day)})

@@ -64,6 +64,11 @@ class DeliveryIn(ApiModel):
     note: str | None = Field(default=None, max_length=1000)
 
 
+class ArrivalIn(ApiModel):
+    vehicle: str | None = Field(default=None, max_length=20)
+    driver: str | None = Field(default=None, max_length=160)
+
+
 class RouteStartIn(ApiModel):
     vehicle: str = Field(min_length=1, max_length=20)
     day: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
